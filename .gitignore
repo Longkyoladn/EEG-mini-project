@@ -1,8 +1,13 @@
-# 1. Bỏ qua các thư mục chứa dữ liệu của từng subject (sub-01, sub-02,...)
-**/sub-*/
+# Bỏ qua dữ liệu của các subjects và metadata của dataset
 sub-*/
+participants.tsv
+participants.json
+dataset_description.json
+task-oddball_*.json
+README
+CHANGES
 
-# 2. Bỏ qua toàn bộ các định dạng file dữ liệu EEG/BIDS và dữ liệu đã tiền xử lý
+# Bỏ qua các định dạng file dữ liệu EEG và mô hình sinh ra trong quá trình chạy
 *.eeg
 *.vhdr
 *.vmrk
@@ -11,14 +16,12 @@ sub-*/
 *.npy
 *.npz
 *.pkl
-*.h5
 *.pt
 *.pth
 
-# 3. Giữ lại các file code Python trong thư mục (dấu ! nghĩa là ngoại lệ không ignore)
-!*.py
-
-# 4. Bỏ qua cache của Python
+# Bỏ qua các file hệ thống và môi trường Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 .ipynb_checkpoints/
