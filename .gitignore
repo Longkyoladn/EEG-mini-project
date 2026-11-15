@@ -1,27 +1,31 @@
-# Bỏ qua dữ liệu của các subjects và metadata của dataset
-sub-*/
-participants.tsv
-participants.json
-dataset_description.json
-task-oddball_*.json
-README
-CHANGES
+# Data (Raw & Processed)
+data/raw/oddball_data/*
+!data/raw/oddball_data/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
 
-# Bỏ qua các định dạng file dữ liệu EEG và mô hình sinh ra trong quá trình chạy
-*.eeg
-*.vhdr
-*.vmrk
-*.tsv
-*.fif
-*.npy
-*.npz
-*.pkl
+# Model weights & Large artifacts
 *.pt
 *.pth
+*.pkl
+*.ckpt
+*.npy
+*.npz
+*.fif
+*.part
 
-# Bỏ qua các file hệ thống và môi trường Python
+# Python & Environments
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
+env/
+
+# Jupyter & Editors
 .ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS generated
+.DS_Store
+Thumbs.db
