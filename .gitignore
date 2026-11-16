@@ -29,3 +29,23 @@ env/
 # OS generated
 .DS_Store
 Thumbs.db
+
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# Data - do not push
+data/raw/
+data/processed/
+
+# Results - do not push
+results/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
