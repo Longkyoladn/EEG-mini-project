@@ -1,5 +1,5 @@
-"""Bộ công cụ khám phá toàn diện dữ liệu EEG (Oddball Paradigm - P300)
-Tệp: src/preprocessing/explore_data.py
+﻿"""Bộ công cụ khám phá toàn diện dữ liệu EEG (Oddball Paradigm - P300)
+Tệp: scripts/explore_data.py
 
 Quy trình 6 bước chuẩn mực trong EEG Signal Processing:
 1. 01 - Dataset Overview: Quét file, kiểm tra sampling rate, số kênh, dung lượng, thời lượng ghi.
@@ -514,7 +514,7 @@ def run_exploration_suite(
     num_detailed_subjects: int = 2,
 ) -> None:
     """Thực thi đầy đủ 6 bước khám phá dữ liệu chuẩn mực."""
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[1]
     if raw_data_dir is None:
         raw_data_dir = project_root / "data" / "raw" / "oddball_data"
     else:
@@ -569,7 +569,7 @@ def run_exploration_suite(
 
 
 if __name__ == "__main__":
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[1]
     raw_dir = project_root / "data" / "raw" / "oddball_data"
     figures_dir = project_root / "results" / "figures" / "exploration"
 
