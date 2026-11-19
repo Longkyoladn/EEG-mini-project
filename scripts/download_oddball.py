@@ -5,8 +5,9 @@ from botocore import UNSIGNED
 from botocore.client import Config
 from tqdm import tqdm
 
-# Lưu trực tiếp vào thư mục oddball_data bên trong thư mục raw
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oddball_data")
+# Lưu vào <project_root>/data/raw/oddball_data (script nằm ở <project_root>/scripts/)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "oddball_data")
 
 # Toàn bộ 41 subjects hợp lệ của bài test Oddball (trừ sub-38 bị lỗi trong dataset gốc)
 SUBJECTS = [i for i in range(1, 43) if i != 38]
