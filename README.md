@@ -9,7 +9,7 @@ Dự án nghiên cứu và phân loại tín hiệu điện não đồ (EEG) the
 - **Bài toán**: Nhận diện và phân loại đáp ứng điện thế liên quan sự kiện (Event-Related Potential - ERP / sóng **P300**) đối với kích thích mục tiêu (Target) và kích thích chuẩn (Non-target/Standard).
 - **Dataset**: [OpenNeuro ds004621](https://openneuro.org/datasets/ds004621).
   - Tác vụ: `task-oddball`
-  - Đối tượng: 41 đối tượng đo hợp lệ (`sub-01` đến `sub-42`, loại trừ `sub-38` do lỗi dữ liệu gốc).
+  - Đối tượng: 42 đối tượng (`sub-01` đến `sub-42`), tất cả đều có đủ dữ liệu task-oddball. Một số subject (vd: `sub-32` trở kháng cao) có thể được loại ở bước tiền xử lý.
   - Tín hiệu: Dữ liệu EEG đa kênh kèm tọa độ điện cực và nhãn sự kiện.
 
 ---
@@ -21,7 +21,7 @@ EEG-mini-project/
 │
 ├── data/
 │   ├── raw/
-│   │   └── oddball_data/               # 41 subjects + metadata (ignored by git)
+│   │   └── oddball_data/               # 42 subjects + metadata (ignored by git)
 │   └── processed/                      # Dữ liệu sau tiền xử lý (epochs, .fif, .npy) (ignored)
 │
 ├── scripts/
@@ -78,7 +78,7 @@ Dữ liệu được tải tự động đa luồng trực tiếp từ S3 Bucket
 python scripts/download_oddball.py
 ```
 
-- Toàn bộ dữ liệu 41 subjects và metadata đi kèm sẽ được tải và lưu tập trung tại thư mục `data/raw/oddball_data/`.
+- Toàn bộ dữ liệu 42 subjects và metadata đi kèm sẽ được tải và lưu tập trung tại thư mục `data/raw/oddball_data/`.
 - Script hỗ trợ tiếp tục tải (skip file đã hoàn tất) và kiểm tra toàn vẹn dung lượng file.
 - Thư mục dữ liệu `oddball_data/` đã được cấu hình trong `.gitignore`, không lo bị vô tình commit lên Git.
 

@@ -4,7 +4,7 @@ Tệp: scripts/explore_data.py
 Quy trình 6 bước chuẩn mực trong EEG Signal Processing:
 1. 01 - Dataset Overview: Quét file, kiểm tra sampling rate, số kênh, dung lượng, thời lượng ghi.
 2. 02 - Channel Analysis: Khám phá hệ thống 127 kênh, kiểm tra kênh EOG trán cực (Fp1, Fp2),
-   kênh tai (TP9, TP10), kiểm tra hoán đổi thứ tự kênh giữa 41 subjects.
+   kênh tai (TP9, TP10), kiểm tra hoán đổi thứ tự kênh giữa 42 subjects.
 3. 03 - Event Analysis: Trích xuất và phân tích trigger (Frequent S5, Target S6, Distractor S7),
    tính tỷ lệ mất cân bằng lớp và trực quan hóa phân bố kích thích.
 4. 04 - Signal Quality Analysis: Kiểm tra toàn vẹn dữ liệu (NaN/Inf), tính toán thống kê biên độ (PtP, std),
@@ -13,7 +13,7 @@ Quy trình 6 bước chuẩn mực trong EEG Signal Processing:
    - Trực quan hóa các đoạn sóng EEG thô trên các kênh đại diện (Fp1, Cz, Pz, Oz).
    - Phân tích phổ mật độ công suất (Power Spectral Density - PSD), nhận diện đỉnh nhiễu điện lưới 50 Hz.
 6. 06 - Inter-subject Analysis: Tổng hợp và so sánh thời lượng, tần số lấy mẫu và số lượng trial
-   giữa toàn bộ 41 đối tượng đo, xuất báo cáo CSV và biểu đồ so sánh.
+   giữa toàn bộ 42 đối tượng đo, xuất báo cáo CSV và biểu đồ so sánh.
 """
 
 from __future__ import annotations
@@ -408,18 +408,18 @@ def visualize_signals_and_psd(
 
 
 # ==============================================================================
-# BƯỚC 6: INTER-SUBJECT ANALYSIS (THỐNG KÊ TOÀN DIỆN 41 SUBJECTS)
+# BƯỚC 6: INTER-SUBJECT ANALYSIS (THỐNG KÊ TOÀN DIỆN 42 SUBJECTS)
 # ==============================================================================
 def analyze_inter_subject_statistics(
     vhdr_files: List[Path],
     output_dir: Path,
 ) -> pd.DataFrame:
-    """Quét metadata của toàn bộ 41 subjects (không preload data, siêu nhanh):
+    """Quét metadata của toàn bộ 42 subjects (không preload data, siêu nhanh):
 
     So sánh tần số lấy mẫu, số kênh, thời lượng ghi và phân bố trial của từng người.
     """
     print(f"\n{'='*75}")
-    print("06. PHÂN TÍCH THỐNG KÊ LIÊN ĐỐI TƯỢNG (INTER-SUBJECT COMPARISON - 41 SUBJECTS)")
+    print("06. PHÂN TÍCH THỐNG KÊ LIÊN ĐỐI TƯỢNG (INTER-SUBJECT COMPARISON - 42 SUBJECTS)")
     print(f"{'='*75}")
 
     summary_rows = []
@@ -538,7 +538,7 @@ def run_exploration_suite(
     vhdr_files = scan_raw_files(raw_data_dir)
     print(f"\n01. QUÉT DỮ LIỆU: Tìm thấy {len(vhdr_files)} file .vhdr trong '{Path(raw_data_dir).resolve()}'.")
 
-    # 2. Kiểm tra tính đồng nhất của hệ thống kênh trên toàn bộ 41 subjects
+    # 2. Kiểm tra tính đồng nhất của hệ thống kênh trên toàn bộ 42 subjects
     check_channel_consistency(vhdr_files)
 
     # 3. Phân tích chi tiết và trực quan hóa cho các subject đại diện

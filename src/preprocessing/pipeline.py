@@ -601,7 +601,7 @@ def process_single_subject(
 # 5. PIPELINE CHÍNH ĐIỀU PHỐI TOÀN BỘ DATASET
 # ==============================================================================
 def run_pipeline(config: Dict = CONFIG) -> None:
-    """Thực thi toàn bộ pipeline cho 41 subjects và xuất trọn bộ dữ liệu Machine Learning."""
+    """Thực thi toàn bộ pipeline cho 42 subjects và xuất trọn bộ dữ liệu Machine Learning."""
     raw_dir = Path(config["RAW_DIR"])
     processed_dir = Path(config["PROCESSED_DIR"])
     processed_dir.mkdir(parents=True, exist_ok=True)
