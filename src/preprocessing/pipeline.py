@@ -1,4 +1,4 @@
-"""Pipeline tiền xử lý chuẩn hóa tín hiệu EEG (Oddball Paradigm - P300)
+"""Pipeline tiền xử lý chuẩn hóa tín hiệu EEG (Oddball Paradigm - P300)  -  V3
 Tệp: src/preprocessing/pipeline.py
 
 Mô tả:
@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -36,9 +37,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import mne
 import numpy as np
 import pandas as pd
+from scipy.signal import freqz
 from tqdm import tqdm
 
-# Thiết lập mức log mặc định cho MNE
 mne.set_log_level("WARNING")
 
 
@@ -97,12 +98,9 @@ CONFIG: Dict[str, Any] = {
 
     # Cấu hình Trigger / Event (Oddball: Frequent Standard vs Rare Target)
     "EVENT_TRIGGER_MAP": {
-        "Frequent": "Stimulus/S  5",   # Kích thích thường xuyên (Standard) -> Nhãn 0
-        "Target": "Stimulus/S  6",     # Kích thích mục tiêu (P300 Target) -> Nhãn 1
-    },
-    "TARGET_LABELS": {
-        "Frequent": 0,
-        "Target": 1,
+        "Frequent": "Stimulus/S  5",
+        "Target": "Stimulus/S  6",
+
     },
     "BEHAVIOR": {
         "rt_min_sec": 0.100,
@@ -111,18 +109,22 @@ CONFIG: Dict[str, Any] = {
         "rt_slow_ms": 550.0,
     },
 
-    # Lọc tín hiệu (Filtering)
+    "RESPONSE_TRIGGER": "Stimulus/S  1",
+    "RT_WINDOW_MS": (150.0, 1500.0),
+
+    "TARGET_LABELS": {"Frequent": 0, "Target": 1},
+
     "FILTER": {
-        "l_freq": 0.5,                 # Thông cao (Hz) - bảo toàn thành phần chậm P300
-        "h_freq": 40.0,                # Thông thấp (Hz)
-        "use_notch": True,             # Có áp dụng Notch Filter 50 Hz hay không
-        "notch_freq": 50.0,            # Tần số khử nhiễu điện lưới (Hz)
+        "l_freq": 0.5,
+        "h_freq": 40.0,
+        "notch_mode": "auto",        # "auto" | "always" | "never"
+        "notch_freq": 50.0,
+        "notch_residual_db": 3.0,    # auto: chỉ notch nếu đỉnh 50 Hz còn nổi > 3 dB SAU bandpass
+        "line_noise_max_sec": 120.0, # đo nhiễu lưới trên tối đa 120 s đầu
     },
 
-    # Tần số lấy mẫu mục tiêu (Resampling)
-    "RESAMPLE_FREQ": 250.0,            # Downsample từ 1000 Hz -> 250 Hz
+    "RESAMPLE_FREQ": 250.0,
 
-    # Phát hiện kênh xấu trước khi Average Reference
     "BAD_CHANNELS": {
         "enabled": True,
         "flat_threshold_std": 1e-7,    # Kênh phẳng: std < 0.1 µV
@@ -134,60 +136,102 @@ CONFIG: Dict[str, Any] = {
     "MONTAGE": "colin27_1005",
     "REFERENCE": "average",            # Average reference toàn bộ điện cực chuẩn
 
-    # Phân tích thành phần độc lập (ICA)
     "ICA": {
-        "method": "fastica",
-        "n_components": 25,            # Số thành phần mong muốn (sẽ kiểm tra rank)
+        "method": "picard",          # "picard" (tự fallback "fastica") | "fastica" | "infomax"
+        "n_components": 25,
         "random_state": 42,
-        "high_pass": 1.0,              # Lọc 1.0 Hz cho bản sao fit ICA
-        "eog_channels": ["Fp1", "Fp2"],# Điện cực trán cực bắt nhiễu mắt
-        "threshold": 3.0,              # Ngưỡng z-score tìm bads EOG
-        "max_excluded_ics": 4,         # Cảnh báo nếu số IC bị loại vượt quá ngưỡng này
-        "save_diagnostic_plots": True, # Lưu biểu đồ ICA cho các subject đại diện
-        "num_diag_subjects": 3,        # Số subject đầu tiên cần lưu hình ảnh ICA
+        "high_pass": 1.0,
+        "fit_epoch_sec": 1.0,        # ICA được fit trên epoch cố định 1 s
+        "fit_reject_ptp": 500e-6,    # bỏ epoch có ptp > 500 µV (giữ lại chớp mắt, bỏ nhiễu cơ/chuyển động)
+        "min_fit_epochs": 60,
+        "eog_proxy": {
+            "veog": ["Fp1", "Fp2"],              # trung bình -> proxy chớp mắt dọc
+            "heog": [["F7", "AF7"], ["F8", "AF8"]],  # (trái - phải) -> proxy liếc ngang (dùng cặp đầu tiên có đủ)
+        },
+        "frontal_channels": ["Fp1", "Fp2", "Fpz", "AF3", "AF4", "AF7", "AF8", "F7", "F8"],
+        "threshold": 3.0,            # z-score của |r| giữa các IC
+        "corr_min": 0.4,             # |r| tối thiểu với proxy
+        "min_frontal_ratio": 1.5,    # tải trung bình vùng trán / tải trung bình toàn bộ >= 1.5
+        "max_excluded_ics": 4,       # GIỚI HẠN CỨNG: chỉ loại tối đa N IC (theo |r| giảm dần)
+        "save_diagnostic_plots": True,
+        "p300_channels": ["Pz", "CPz", "Cz"],
+        "p300_window": (0.3, 0.5),
+        "p300_change_warn_pct": 30.0,
     },
 
-    # Cắt đoạn (Epoching) & Loại bỏ biên độ cao
     "EPOCHS": {
-        "tmin": -0.2,                  # Bắt đầu epoch (giây) trước stimulus
-        "tmax": 0.8,                   # Kết thúc epoch (giây) sau stimulus
-        "baseline": (-0.2, 0.0),       # Hiệu chỉnh đường nền
-        "reject_amp": 150e-6,          # Ngưỡng biên độ loại bỏ trial: 150 µV (150e-6 V)
+        "tmin": -0.2,
+        "tmax": 0.8,
+        "baseline": (-0.2, 0.0),
+        "reject_amp": 150e-6,
     },
 
     # Ánh xạ tên kênh không chuẩn sang chuẩn quốc tế 10-05 / colin27_1005
     "CHANNEL_ALIASES": dict(CHANNEL_ALIASES),
 
-    # Tùy chọn lưu trữ
+    "EXCLUDE_SUBJECTS": ["sub-02", "sub-14", "sub-17"],
+
+    
+
     "SAVE_SINGLE_SUBJECT_FIF": True,
-    "SAVE_ABLATION_STUDY": True,       # Lưu bộ dữ liệu đối chứng (X_no_ica_no_reject.npy)
+    "SAVE_ABLATION_STUDY": True,    # lưu A (no ICA/no reject), B (ICA/no reject), keep_mask
 }
 
 
 # ==============================================================================
 # 2. HỆ THỐNG GHI NHẬT KÝ (LOGGING) & TIỆN ÍCH CHUNG
 # ==============================================================================
+def default_project_root() -> Path:
+    """SỬA [6]: không crash khi chạy trong notebook (không có __file__)."""
+    env = os.getenv("EEG_ROOT")
+    if env:
+        return Path(env)
+    try:
+        return Path(__file__).resolve().parents[2]
+    except (NameError, IndexError):
+        return Path.cwd()
+
+
+def resolve_paths(config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(config)
+    root = default_project_root()
+    if cfg.get("RAW_DIR") is None:
+        cfg["RAW_DIR"] = root / "data" / "raw" / "oddball_data"
+    if cfg.get("PROCESSED_DIR") is None:
+        cfg["PROCESSED_DIR"] = root / "data" / "processed"
+    if cfg.get("FIGURES_DIR") is None:
+        cfg["FIGURES_DIR"] = root / "results" / "figures" / "ica"
+    for k in ("RAW_DIR", "PROCESSED_DIR", "FIGURES_DIR", "STAGE_LOCAL_DIR"):
+        if cfg.get(k) is not None:
+            cfg[k] = Path(cfg[k])
+    return cfg
+
+
 def setup_logging(log_file: Path) -> logging.Logger:
-    """Khởi tạo logger đa kênh xuất ra console và tệp log."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("EEG_Pipeline")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
+    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")  # 'a' để giữ log khi RESUME
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
     return logger
+
+
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    return obj
 
 
 def _to_json_serializable(obj: Any) -> Any:
@@ -215,18 +259,16 @@ def natural_sort_key(s: str) -> List[int | str]:
 
 
 def extract_subject_id(vhdr_path: Path) -> str:
-    """Trích xuất subject_id an toàn bằng regex (hỗ trợ cả sub-01/ hay sub-01/eeg/)."""
-    match = re.search(r"(sub-\d+)", vhdr_path.stem)
-    if match:
-        return match.group(1)
-    match_parent = re.search(r"(sub-\d+)", str(vhdr_path))
-    if match_parent:
-        return match_parent.group(1)
+    m = re.search(r"(sub-\d+)", vhdr_path.stem)
+    if m:
+        return m.group(1)
+    m = re.search(r"(sub-\d+)", str(vhdr_path))
+    if m:
+        return m.group(1)
     return vhdr_path.parent.name
 
 
 def normalize_event_name(name: str) -> str:
-    """Chuẩn hóa tên sự kiện: loại bỏ toàn bộ khoảng trắng dư thừa và chuyển về chữ thường."""
     return re.sub(r"\s+", "", name).lower()
 
 
@@ -438,7 +480,7 @@ def extract_behaviorally_clean_events(
 
 
 def extract_events_safe(
-    raw: mne.io.Raw,
+    raw,
     trigger_map: Dict[str, str],
     logger: logging.Logger,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
@@ -460,7 +502,7 @@ def extract_events_safe(
         ]
 
         if len(matches) == 1:
-            mne_target_mapping[matches[0]] = target_code
+            mapping[matches[0]] = code
         else:
             err_msg = (
                 f"LỖI GÁN NHÃN: Trigger '{class_name}' (pattern='{trigger_pattern}') "
@@ -508,7 +550,11 @@ def setup_channel_montage(
             f"sau gán montage '{montage_name}': {no_position_chs}"
         )
 
-    return no_position_chs
+def template_montage():
+    """Montage 10-05 mẫu. MNE >= 1.13 đã deprecate 'standard_1005' (thay bằng 'colin27_1005')."""
+    available = mne.channels.get_builtin_montages()
+    name = "colin27_1005" if "colin27_1005" in available else "standard_1005"
+    return mne.channels.make_standard_montage(name), name
 
 
 def detect_and_handle_bad_channels(
@@ -536,7 +582,7 @@ def detect_and_handle_bad_channels(
     mad = float(np.median(np.abs(valid_stds - median_std))) if len(valid_stds) > 0 else 0.0
     if mad <= 1e-12:
         logger.warning(f"[{sub_id}] MAD ≈ 0. Bỏ qua phát hiện noisy channels.")
-        z_scores = np.zeros_like(stds)
+        z = np.zeros_like(stds)
     else:
         z_scores = 0.6745 * (stds - median_std) / mad
 
@@ -577,9 +623,83 @@ def parse_drop_log_reasons(epochs: mne.Epochs, raw: mne.io.Raw) -> Dict[str, int
         elif any("BAD" in str(item).upper() or "BOUNDARY" in str(item).upper() for item in drop):
             reasons["annotation_rejected"] += 1
         else:
-            reasons["boundary_or_other"] += 1
+            out["boundary_or_other"] += 1
+    return out
 
-    return reasons
+
+# ==============================================================================
+# 6. ICA (SỬA [3], [5])
+# ==============================================================================
+def build_eog_proxies(raw, proxy_cfg: Dict) -> Dict[str, np.ndarray]:
+    names = set(raw.ch_names)
+    proxies: Dict[str, np.ndarray] = {}
+    v = [c for c in proxy_cfg["veog"] if c in names]
+    if v:
+        proxies["VEOG"] = raw.get_data(picks=v).mean(axis=0)
+    lefts, rights = proxy_cfg["heog"]
+    for left, right in zip(lefts, rights):
+        if left in names and right in names:
+            proxies["HEOG"] = raw.get_data(picks=[left])[0] - raw.get_data(picks=[right])[0]
+            break
+    return proxies
+
+
+def select_eog_components(ica, raw, ica_cfg: Dict, logger, sub_id: str) -> Tuple[List[int], List[Dict[str, float]]]:
+    """Chọn IC mắt: |r| với proxy VEOG/HEOG, z-score giữa các IC, và tải vùng trán."""
+    proxies = build_eog_proxies(raw, ica_cfg["eog_proxy"])
+    if not proxies:
+        logger.warning(f"[{sub_id}] Không có kênh trán để tạo proxy EOG -> không loại IC nào.")
+        return [], []
+    S = ica.get_sources(raw).get_data()
+    S = (S - S.mean(axis=1, keepdims=True)) / (S.std(axis=1, keepdims=True) + 1e-20)
+
+    A = np.abs(ica.get_components())
+    front = [i for i, c in enumerate(ica.ch_names) if c in set(ica_cfg["frontal_channels"])]
+    ratio = (A[front].mean(axis=0) / (A.mean(axis=0) + 1e-20)) if front else np.zeros(A.shape[1])
+
+    best_r = np.zeros(S.shape[0])
+    for _, p in proxies.items():
+        p = (p - p.mean()) / (p.std() + 1e-20)
+        r = np.abs(S @ p) / S.shape[1]
+        best_r = np.maximum(best_r, r)
+    z = (best_r - best_r.mean()) / (best_r.std() + 1e-20)
+
+    cand = [i for i in range(len(best_r))
+            if best_r[i] >= ica_cfg["corr_min"] and z[i] >= ica_cfg["threshold"]
+            and ratio[i] >= ica_cfg["min_frontal_ratio"]]
+    cand = sorted(cand, key=lambda i: -best_r[i])
+    if len(cand) > ica_cfg["max_excluded_ics"]:
+        logger.warning(f"[{sub_id}] {len(cand)} IC thỏa tiêu chí mắt > giới hạn {ica_cfg['max_excluded_ics']}; "
+                       f"chỉ giữ top theo |r|. Nên kiểm tra thủ công subject này.")
+        cand = cand[: ica_cfg["max_excluded_ics"]]
+    details = [{"ic": i, "abs_r": float(best_r[i]), "z": float(z[i]), "frontal_ratio": float(ratio[i])} for i in range(len(best_r))]
+    return sorted(cand), details
+
+
+def save_ica_diag(details: List[Dict], excluded: List[int], fig_dir: Path, sub_id: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    idx = [d["ic"] for d in details]
+    r = [d["abs_r"] for d in details]
+    fr = [d["frontal_ratio"] for d in details]
+    fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
+    cols = ["#d62728" if i in excluded else "#7f7f7f" for i in idx]
+    ax[0].bar(idx, r, color=cols); ax[0].set_title(f"{sub_id}: |r| với proxy EOG"); ax[0].set_xlabel("IC")
+    ax[1].bar(idx, fr, color=cols); ax[1].set_title("Tỷ lệ tải vùng trán"); ax[1].set_xlabel("IC")
+    fig.tight_layout(); fig.savefig(fig_dir / f"{sub_id}_ica_diag.png", dpi=120); plt.close(fig)
+
+
+def p300_effect(epochs, channels: List[str], window: Tuple[float, float]) -> Optional[float]:
+    ch = next((c for c in channels if c in epochs.ch_names), None)
+    if ch is None or len(epochs["Target"]) == 0 or len(epochs["Frequent"]) == 0:
+        return None
+    t = epochs.times
+    sel = (t >= window[0]) & (t <= window[1])
+    tgt = epochs["Target"].get_data(picks=[ch])[:, 0, :].mean(axis=0)
+    frq = epochs["Frequent"].get_data(picks=[ch])[:, 0, :].mean(axis=0)
+    return float((tgt - frq)[sel].mean())
 
 
 # ==============================================================================
@@ -677,6 +797,10 @@ def process_single_subject(
     sub_id = extract_subject_id(vhdr_path)
     events_tsv_path = _locate_events_tsv(vhdr_path, sub_id)
     logger.info(f"--- BẮT ĐẦU XỬ LÝ: {sub_id} ({vhdr_path.name}) ---")
+    n_jobs = config.get("N_JOBS", 1)
+    fcfg, ica_cfg, ecfg = config["FILTER"], config["ICA"], config["EPOCHS"]
+    files = _subject_files(out_dir / "subjects", sub_id)
+    files["stats"].parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Đọc dữ liệu thô & kiểm tra _channels.tsv (Latin-1)
     raw = mne.io.read_raw_brainvision(vhdr_path, preload=True, verbose=False)
@@ -962,12 +1086,18 @@ def process_single_subject(
         "data_rank": data_rank,
         "ica_exp_variance": round(exp_var, 2),
     }
+    files["stats"].write_text(json.dumps(_jsonable(stats), indent=2), encoding="utf-8")
+    logger.info(f"[{sub_id}] Xong: {initial} -> {stats['clean_kept']} epoch "
+                f"(biên độ loại {amp_rej}, biên {stats['boundary_rejected']}); {stats['seconds']} s.")
+    del raw, epochs_b, XA, XB, ica
+    gc.collect()
+    return stats
 
     return epochs_clean, epochs_no_ica, meta_clean, meta_no_ica, stats
 
 
 # ==============================================================================
-# 5. PIPELINE CHÍNH ĐIỀU PHỐI TOÀN BỘ DATASET
+# 9. PIPELINE CHÍNH
 # ==============================================================================
 def run_pipeline(
     config: Dict[str, Any] = CONFIG,
@@ -1138,7 +1268,7 @@ def run_pipeline(
             subject_stats.append(stats)
 
         except Exception as err:
-            logger.error(f"[!] LỖI TẠI SUBJECT {sub_id}: {str(err)}")
+            logger.error(f"[!] LỖI TẠI {sub_id}: {err}")
             logger.error(traceback.format_exc())
             failed_subjects.append({"subject_id": sub_id, "error": str(err)})
             continue
