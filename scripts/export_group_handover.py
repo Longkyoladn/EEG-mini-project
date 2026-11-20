@@ -42,8 +42,6 @@ PER_FOLD_SPECS: List[Tuple[str, str, int]] = [
     ("p300_atcnet_loso", "metrics_dl2_loso_p300_atcnet.json", 39),
     ("p300_atcnet_cs5_clean", "metrics_dl2_cs5_p300_atcnet_clean.json", 5),
     ("p300_atcnet_cs5_no_ica", "metrics_dl2_cs5_p300_atcnet_no_ica.json", 5),
-    ("eegnet_within", "metrics_dl2_ws_eegnet.json", 195),
-    ("eegnet_cs5_clean", "metrics_pilot_cs5_eegnet.json", 5),
 ]
 
 # (output_prefix, source_predictions_csv)
@@ -51,8 +49,6 @@ PREDS_SPECS: List[Tuple[str, str]] = [
     ("p300_atcnet_within", "predictions_dl2_ws_p300_atcnet.csv"),
     ("p300_atcnet_loso", "predictions_dl2_loso_p300_atcnet.csv"),
     ("p300_atcnet_cs5_clean", "predictions_dl2_cs5_p300_atcnet_clean.csv"),
-    ("eegnet_within", "predictions_dl2_ws_eegnet.csv"),
-    ("eegnet_cs5_clean", "predictions_pilot_cs5_eegnet.csv"),
 ]
 
 
