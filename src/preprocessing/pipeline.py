@@ -818,7 +818,7 @@ def stage_subject_files(vhdr_path: Path, stage_dir: Path, sub_id: str) -> Path:
 # 9. PIPELINE CHÍNH
 # ==============================================================================
 def run_pipeline(config: Dict = CONFIG) -> None:
-
+    
     config = resolve_paths(config)
     raw_dir, processed_dir = Path(config["RAW_DIR"]), Path(config["PROCESSED_DIR"])
     processed_dir.mkdir(parents=True, exist_ok=True)

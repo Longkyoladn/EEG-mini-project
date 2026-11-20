@@ -1,51 +1,54 @@
-# Data (Raw & Processed)
+# ── Data (raw & processed) ─────────────────────────
+# Dataset downloaded at repo root (OpenNeuro oddball)
+/oddball_data/
+
+# Standard layout: keep folders via .gitkeep, ignore contents (keep scripts)
 data/raw/oddball_data/*
 !data/raw/oddball_data/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
 
-# Model weights & Large artifacts
+# EEG / data file formats & partial downloads
+*.eeg
+*.vhdr
+*.vmrk
+*.edf
+*.bdf
+*.set
+*.fdt
+*.fif
+*.npy
+*.npz
+*.part
+*.eeg.*
+
+# ── Results (keep .gitkeep only) ───────────────────
+results/*
+!results/*/
+results/*/*
+!results/*/.gitkeep
+
+# ── Model weights / checkpoints ────────────────
 *.pt
 *.pth
 *.pkl
 *.ckpt
-*.npy
-*.npz
-*.fif
-*.part
 
-# Python & Environments
+# ── Logs ───────────────────────────────────────
+*.log
+
+# ── Python & environments ──────────────────────
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 env/
 
-# Jupyter & Editors
+# ── Jupyter & editors ──────────────────────────
 .ipynb_checkpoints/
 .vscode/
 .idea/
 
-# OS generated
+# ── OS ─────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-
-# Jupyter
-.ipynb_checkpoints/
-
-
-# Data - do not push
-data/raw/
-data/processed/
-
-# Results - do not push
-results/
-
-# Model checkpoints
-*.pt
-*.pth
-*.ckpt
-
-# Logs
-*.log

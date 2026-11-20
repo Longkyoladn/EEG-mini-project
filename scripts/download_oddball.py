@@ -5,11 +5,13 @@ from botocore import UNSIGNED
 from botocore.client import Config
 from tqdm import tqdm
 
-# Lưu trực tiếp vào thư mục oddball_data bên trong thư mục raw
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oddball_data")
+# Lưu vào <project_root>/data/raw/oddball_data (script nằm ở <project_root>/scripts/)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "oddball_data")
 
-# Toàn bộ 41 subjects hợp lệ của bài test Oddball (trừ sub-38 bị lỗi trong dataset gốc)
-SUBJECTS = [i for i in range(1, 43) if i != 38]
+# Toàn bộ 42 subjects (sub-01..sub-42) đều có đủ dữ liệu task-oddball.
+# Việc loại subject (vd: sub-32) để ở bước tiền xử lý, không loại ở bước tải.
+SUBJECTS = range(1, 43)
 
 BUCKET = "openneuro.org"
 PREFIX = "ds004621/"
@@ -22,22 +24,22 @@ def get_s3_client():
 
 def collect_download_Manifest(s3):
     """
-    Quét S3 để lập danh sách toàn bộ các file cần tải (Gồm cả Metadata + EEG Oddball).
+    Quét S3 để lập danh sách các file cần tải (metadata chung + EEG task-oddball).
     Trả về list các tuple: (s3_key, local_path, file_size)
     """
     manifest = []
 
-    # 1. Quét các file metadata ở thư mục gốc (README, participants.tsv, task-oddball_events.json...)
+    # 1. Metadata ở thư mục gốc: README, CHANGES, participants.*, dataset_description.json, task-oddball_*.json
+    #    (bỏ qua task-msit/srt/rest)
     root_resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX, Delimiter="/")
     for obj in root_resp.get("Contents", []):
         key = obj["Key"]
         fname = os.path.basename(key)
-        # Lấy các file chung của dataset hoặc file cấu hình riêng của task-oddball
         if fname and not fname.startswith(".") and ("task-" not in fname or "task-oddball" in fname):
             local_path = os.path.join(DATA_DIR, fname)
             manifest.append((key, local_path, obj["Size"]))
 
-    # 2. Quét từng Subject để lấy dữ liệu EEG task-oddball + Metadata điện cực/kênh
+    # 2. Từng subject: chỉ lấy file task-oddball (.eeg, .vhdr, .vmrk, _events.tsv, _channels.tsv)
     for sub_id in SUBJECTS:
         sub_str = f"sub-{sub_id:02d}"
         sub_prefix = f"{PREFIX}{sub_str}/eeg/"
@@ -48,14 +50,7 @@ def collect_download_Manifest(s3):
             key = obj["Key"]
             fname = os.path.basename(key)
 
-            # Chỉ lọc lấy:
-            # - Toàn bộ file của task-oddball (.eeg, .vhdr, .vmrk, _events.tsv, _channels.tsv, _eeg.json)
-            # - Các file tọa độ điện cực dùng chung của subject (_electrodes.tsv, _coordsystem.json)
-            if (
-                "task-oddball" in fname
-                or "electrodes.tsv" in fname
-                or "coordsystem.json" in fname
-            ):
+            if "task-oddball" in fname:
                 local_path = os.path.join(sub_dir, fname)
                 manifest.append((key, local_path, obj["Size"]))
 

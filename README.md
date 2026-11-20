@@ -9,7 +9,7 @@ Dự án nghiên cứu và phân loại tín hiệu điện não đồ (EEG) the
 - **Bài toán**: Nhận diện và phân loại đáp ứng điện thế liên quan sự kiện (Event-Related Potential - ERP / sóng **P300**) đối với kích thích mục tiêu (Target) và kích thích chuẩn (Non-target/Standard).
 - **Dataset**: [OpenNeuro ds004621](https://openneuro.org/datasets/ds004621).
   - Tác vụ: `task-oddball`
-  - Đối tượng: 41 đối tượng đo hợp lệ (`sub-01` đến `sub-42`, loại trừ `sub-38` do lỗi dữ liệu gốc).
+  - Đối tượng: 42 đối tượng (`sub-01` đến `sub-42`), tất cả đều có đủ dữ liệu task-oddball. Một số subject (vd: `sub-32` trở kháng cao) có thể được loại ở bước tiền xử lý.
   - Tín hiệu: Dữ liệu EEG đa kênh kèm tọa độ điện cực và nhãn sự kiện.
 
 ---
@@ -17,34 +17,32 @@ Dự án nghiên cứu và phân loại tín hiệu điện não đồ (EEG) the
 ## 📂 2. Cấu trúc dự án
 
 ```text
-EEG-Single-Trial-Classification/
+EEG-mini-project/
 │
 ├── data/
 │   ├── raw/
-│   │   ├── download_exact_oddball.py   # Script tự động đồng bộ dữ liệu S3
-│   │   └── oddball_data/               # Thư mục chứa 41 subjects và metadata (ignored by git)
-│   └── processed/                      # Dữ liệu sau tiền xử lý (epochs, features, .fif, .npy)
+│   │   └── oddball_data/               # 42 subjects + metadata (ignored by git)
+│   └── processed/                      # Dữ liệu sau tiền xử lý (epochs, .fif, .npy) (ignored)
 │
-├── notebooks/
-│   ├── 01_data_exploration/            # Khám phá cấu trúc dữ liệu, kênh đo, tín hiệu thô
-│   ├── 02_preprocessing/               # Lọc dải tần (Bandpass), loại bỏ nhiễu/ICA, Epoching
-│   ├── 03_erp_analysis/                # Tính trung bình ERP, trực quan hóa sóng P300
-│   ├── 04_standard_ml/                 # Phân loại bằng ML truyền thống (CSP, SVM, LDA, RF)
-│   └── 05_deep_learning/               # Mô hình học sâu (EEGNet, ShallowFBCSPNet, CNN-LSTM)
+├── scripts/
+│   ├── download_oddball.py             # Tải dữ liệu từ S3 OpenNeuro
+│   └── explore_data.py                 # Khám phá dữ liệu, xuất hình vào results/figures/exploration
 │
-├── src/
-│   ├── preprocessing/                  # Module tiền xử lý tín hiệu
+├── notebooks/                          # Notebook phẳng: 01_exploration, 02_preprocessing, 03_erp, 04_ml, 05_dl
+│
+├── src/                                # Code tái sử dụng (notebook/script import vào)
+│   ├── preprocessing/                  # Pipeline tiền xử lý (pipeline.py)
 │   ├── models/                         # Kiến trúc mô hình ML & DL
 │   ├── training/                       # Pipeline huấn luyện, tối ưu siêu tham số
 │   └── evaluation/                     # Đánh giá (ROC-AUC, Confusion Matrix, Cross-Validation)
 │
-├── results/
-│   ├── figures/                        # Biểu đồ trực quan hóa, sóng ERP, phổ công suất
-│   ├── metrics/                        # Báo cáo kết quả phân loại (accuracy, f1-score, auc)
-│   └── checkpoints/                    # Trọng số mô hình đã huấn luyện (.pt, .pth, .pkl)
+├── results/                            # (nội dung bị ignore, chỉ giữ .gitkeep)
+│   ├── figures/                        # Biểu đồ, sóng ERP, phổ công suất
+│   ├── metrics/                        # Accuracy, F1-score, AUC
+│   └── checkpoints/                    # Trọng số mô hình (.pt, .pth, .pkl)
 │
 ├── reports/                            # Báo cáo đồ án / thuyết trình
-├── requirements.txt                    # Thư viện phụ thuộc của dự án
+├── requirements.txt
 ├── README.md
 └── .gitignore
 ```
@@ -77,10 +75,10 @@ pip install -r requirements.txt
 Dữ liệu được tải tự động đa luồng trực tiếp từ S3 Bucket của OpenNeuro qua script:
 
 ```powershell
-python data/raw/download_exact_oddball.py
+python scripts/download_oddball.py
 ```
 
-- Toàn bộ dữ liệu 41 subjects và metadata đi kèm sẽ được tải và lưu tập trung tại thư mục `data/raw/oddball_data/`.
+- Toàn bộ dữ liệu 42 subjects và metadata đi kèm sẽ được tải và lưu tập trung tại thư mục `data/raw/oddball_data/`.
 - Script hỗ trợ tiếp tục tải (skip file đã hoàn tất) và kiểm tra toàn vẹn dung lượng file.
 - Thư mục dữ liệu `oddball_data/` đã được cấu hình trong `.gitignore`, không lo bị vô tình commit lên Git.
 
@@ -88,17 +86,17 @@ python data/raw/download_exact_oddball.py
 
 ## 🔄 5. Quy trình thực hiện (Pipeline)
 
-1. **Khám phá dữ liệu (`notebooks/01_data_exploration/`)**:
+1. **Khám phá dữ liệu (`scripts/explore_data.py` / `notebooks/01_exploration.ipynb`)**:
    - Kiểm tra thông tin kênh đo, tỷ lệ lấy mẫu, sự kiện (Events/Triggers: Target vs. Standard).
-2. **Tiền xử lý (`notebooks/02_preprocessing/` & `src/preprocessing/`)**:
+2. **Tiền xử lý (`notebooks/02_preprocessing.ipynb` & `src/preprocessing/`)**:
    - Lọc dải tần (Band-pass filter, e.g., 0.1 - 30 Hz), lọc Notching 50Hz.
    - Loại bỏ artifacts bằng ICA hoặc ngưỡng biên độ.
    - Cắt epoch (-200ms đến 800ms quanh kích thích) và hiệu chỉnh baseline.
-3. **Phân tích ERP (`notebooks/03_erp_analysis/`)**:
+3. **Phân tích ERP (`notebooks/03_erp_analysis.ipynb`)**:
    - Trực quan hóa hình thái sóng P300 (đỉnh dương xuất hiện khoảng 300 - 500ms sau kích thích mục tiêu, rõ nhất tại các điện cực đỉnh/trung tâm như Pz, Cz).
 4. **Phân loại Single-Trial**:
-   - **Machine Learning (`notebooks/04_standard_ml/`)**: Trích xuất đặc trưng thời gian - tần số, CSP (Common Spatial Pattern) kết hợp SVM / LDA / Random Forest.
-   - **Deep Learning (`notebooks/05_deep_learning/`)**: Huấn luyện các kiến trúc chuyên biệt cho EEG như EEGNet, ShallowFBCSPNet.
+   - **Machine Learning (`notebooks/04_standard_ml.ipynb`)**: Trích xuất đặc trưng thời gian - tần số, CSP (Common Spatial Pattern) kết hợp SVM / LDA / Random Forest.
+   - **Deep Learning (`notebooks/05_deep_learning.ipynb`)**: Huấn luyện các kiến trúc chuyên biệt cho EEG như EEGNet, ShallowFBCSPNet.
 5. **Đánh giá (`results/` & `reports/`)**:
    - Cross-Validation (Within-subject và Cross-subject).
    - Đánh giá qua các chỉ số: Balanced Accuracy, F1-Score, ROC-AUC.
