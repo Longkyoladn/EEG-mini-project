@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import time
 from pathlib import Path
 
@@ -28,7 +28,17 @@ from src.training.dataset_dl2 import (
 )
 from src.training.trainer_dl2 import load_checkpoint_for_eval, train_single_fold
 
-PILOT_DATA_DIR = Path("data/processed_pilot")
+def _resolve_data_dir() -> Path:
+    env_dir = os.environ.get("EEG_DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    default_prod = Path("data/processed")
+    if (default_prod / "X_clean.npy").exists():
+        return default_prod
+    return Path("data/processed_pilot")
+
+
+PILOT_DATA_DIR = _resolve_data_dir()
 
 
 def test_zero_leakage_scaler_and_volts_precision(tmp_path: Path) -> None:
@@ -179,11 +189,13 @@ def test_dataset_loader_sha256_and_no_ica(tmp_path: Path) -> None:
         tr, va, te = set(f_no_ica["train_idx"]), set(f_no_ica["val_idx"]), set(f_no_ica["test_idx"])
         assert tr.isdisjoint(va) and tr.isdisjoint(te) and va.isdisjoint(te)
 
-    # Giả lập sai SHA-256 -> bắt buộc raise ValueError
+    # Giả lập sai SHA-256 -> bắt buộc raise ValueError (chỉ ghi lát cắt 8 trials đầu)
     bad_dir = tmp_path / "bad_sha"
     bad_dir.mkdir()
-    for fname in ("X_clean.npy", "y.npy", "subject_ids.npy", "metadata.csv"):
-        shutil.copy(PILOT_DATA_DIR / fname, bad_dir / fname)
+    np.save(bad_dir / "X_clean.npy", clean_bundle.X[:8])
+    np.save(bad_dir / "y.npy", clean_bundle.y[:8])
+    np.save(bad_dir / "subject_ids.npy", clean_bundle.subject_ids[:8])
+    clean_bundle.metadata.iloc[:8].to_csv(bad_dir / "metadata.csv", index=False)
     with open(PILOT_DATA_DIR / "splits.json", "r", encoding="utf-8") as f:
         tampered_splits = json.load(f)
     tampered_splits["trial_uid_sha256"] = "0" * 64
