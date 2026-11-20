@@ -37,8 +37,6 @@ from src.training.trainer_dl2 import train_single_fold
 
 
 def _default_exp_name(args: argparse.Namespace) -> str:
-    if args.model == "eegnet":
-        return f"eegnet_{args.protocol}_{args.data_variant}_s{args.seed}"
     shared_tag = "shared" if args.shared_branch else "indep"
     return (
         f"p300_atcnet_{args.readout}_w{args.n_windows}_{shared_tag}_"
@@ -47,14 +45,6 @@ def _default_exp_name(args: argparse.Namespace) -> str:
 
 
 def _resolve_model_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
-    if args.model == "eegnet":
-        kwargs: Dict[str, Any] = {}
-        if args.dropout is not None:
-            kwargs["dropout"] = float(args.dropout)
-        if args.spatial_max_norm is not None:
-            kwargs["spatial_max_norm"] = float(args.spatial_max_norm)
-        return kwargs
-
     dropout_val = 0.3 if args.dropout is None else float(args.dropout)
     spatial_norm_val = 2.0 if args.spatial_max_norm is None else float(args.spatial_max_norm)
     return {
@@ -260,7 +250,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Huấn luyện và đánh giá các mô hình DL nhánh 2 (EEGNetV4 & P300-ATCNet)."
+        description="Huấn luyện và đánh giá các mô hình DL nhánh 2 (P300-ATCNet)."
     )
     parser.add_argument(
         "--data-dir",
@@ -278,9 +268,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=str,
-        choices=["eegnet", "p300_atcnet"],
+        choices=["p300_atcnet"],
         default="p300_atcnet",
-        help="Kiến trúc mô hình: eegnet hoặc p300_atcnet.",
+        help="Kiến trúc mô hình: p300_atcnet.",
     )
     parser.add_argument(
         "--protocol",
@@ -303,7 +293,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Tùy chọn lọc chỉ số fold (vd: 0 1).",
     )
 
-    # Tham số cấu hình P300ATCNet (và override tùy chọn cho EEGNetV4)
+    # Tham số cấu hình P300ATCNet
     parser.add_argument(
         "--readout",
         type=str,
@@ -338,13 +328,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--spatial-max-norm",
         type=float,
         default=None,
-        help="Ngưỡng L2 max-norm lớp spatial_conv (mặc định: 2.0 cho P300ATCNet, 1.0 cho EEGNetV4).",
+        help="Ngưỡng L2 max-norm lớp spatial_conv (mặc định: 2.0).",
     )
     parser.add_argument(
         "--dropout",
         type=float,
         default=None,
-        help="Tỷ lệ dropout (mặc định: 0.3 cho P300ATCNet, 0.25 cho EEGNetV4).",
+        help="Tỷ lệ dropout (mặc định: 0.3).",
     )
 
     # Hyperparameters huấn luyện
