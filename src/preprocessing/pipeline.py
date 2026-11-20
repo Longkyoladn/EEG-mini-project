@@ -1,34 +1,38 @@
 """Pipeline tiền xử lý chuẩn hóa tín hiệu EEG (Oddball Paradigm - P300)  -  V3
 Tệp: src/preprocessing/pipeline.py
 
-Các thay đổi so với V2 (xem mục "SỬA" trong từng hàm):
-  [1] Montage: ĐỌC tọa độ điện cực đo thực tế (BIDS electrodes.tsv / .bvct), kiểm tra tính hợp lý,
-      fallback montage mẫu 10-05 (colin27_1005/standard_1005 tùy phiên bản MNE). Ghi nguồn montage vào subject_summary.csv.
-  [2] Bộ nhớ: mỗi subject ghi ra đĩa rồi giải phóng RAM; ghép cuối bằng np.memmap (không np.concatenate).
-      Có RESUME: subject đã xong sẽ được bỏ qua khi chạy lại.
-  [3] Tốc độ: resample 1000 -> 250 Hz NGAY SAU KHI ĐỌC (trước khi lọc), ICA fit trên các epoch 1 s đã
-      loại đoạn nhiễu lớn, ưu tiên Picard (tự fallback FastICA).
-  [4] Notch 50 Hz: tự quyết định dựa trên đo đạc (độ nổi 50 Hz trừ suy giảm của bộ bandpass).
-  [5] IC mắt: dùng proxy VEOG/HEOG từ kênh trán + tương quan + hệ số tải vùng trán + giới hạn số IC loại;
-      so sánh biên độ P300 trước/sau ICA để phát hiện mất tín hiệu hữu ích.
-  [6] Đường dẫn: không phụ thuộc __file__; nhận từ tham số dòng lệnh / biến môi trường EEG_ROOT / Colab.
-  [7] Ablation: 3 nhánh KHỚP TỪNG TRIAL: A (no ICA, no reject), B (ICA, no reject), C (ICA + reject = B[keep_mask]).
+Mô tả:
+Pipeline tiền xử lý dữ liệu EEG đơn thử nghiệm (Single-Trial Classification)
+theo Data Contract đã kiểm toán tại `reports/DATA_AUDIT_REPORT.md`:
+1. Cohort Policy: Mặc định loại 3 subjects sai luật hành vi (`sub-02, sub-14, sub-17`),
+   giữ `sub-38` (775 stimuli) tạo tập chuẩn 39 subjects sạch.
+2. Cắt gọn `raw.crop()` về cửa sổ task `[first_stim - 5s, last_stim + 5s]` TRƯỚC mọi
+   bước lọc, phát hiện kênh xấu, và ICA để loại bỏ bão hòa cuối file (`sub-08`, `sub-35`).
+3. Hệ 127 kênh chuẩn & Montage `colin27_1005` (`on_missing='raise'`): áp dụng đủ 4 aliases
+   `{'TP9 LEFT EAR': 'TP9', 'TP10 RIGHT EAR': 'TP10', 'O9': 'I1', 'O10': 'I2'}`,
+   đồng bộ thứ tự kênh theo `CANONICAL_127_CHANNELS`, đọc `_channels.tsv` với `encoding='latin1'`.
+4. Phát hiện và nội suy kênh xấu TRƯỚC `set_eeg_reference('average')` để kênh hỏng
+   (`I2` của `sub-16`, `sub-41`) không làm ô nhiễm Average Reference.
+5. Lọc hành vi chính xác (`S  5` Frequent CR vs `S  6` Target Hit với `100 <= RT <= 1500 ms`),
+   sinh `trial_uid = f"{sub_id}_{onset_sample_1000hz}"`, `rt_ms`, `rt_group`.
+6. Đồng bộ trục mẫu qua `crop()` + `resample(250.0, events=...)`, đánh dấu `BAD boundary`
+   với `reject_by_annotation=True`, lọc Notch 50 Hz + Bandpass 0.5-40 Hz, ICA 250 Hz,
+   xuất tensor `(N, 127, 251)` `float32` cho nhánh `clean` và nhánh đối chứng `no_ica`.
+7. Hỗ trợ CLI (`--subjects`, `--all`, `--out-dir`, `--resume`) và cache từng subject.
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import logging
-import os
 import re
 import shutil
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mne
 import numpy as np
@@ -40,22 +44,69 @@ mne.set_log_level("WARNING")
 
 
 # ==============================================================================
-# 1. CẤU HÌNH
+# 1. HẰNG SỐ DATA CONTRACT & BẢNG CẤU HÌNH HỆ THỐNG (CONFIG)
 # ==============================================================================
-CONFIG: Dict[str, Any] = {
-    # Đường dẫn: để None -> tự suy ra từ EEG_ROOT / vị trí file / thư mục hiện tại (xem resolve_paths)
-    "RAW_DIR": None,
-    "PROCESSED_DIR": None,
-    "FIGURES_DIR": None,
-    # Colab: đặt "/content/tmp_raw" để copy từng subject từ Drive về đĩa local trước khi đọc (nhanh hơn nhiều)
-    "STAGE_LOCAL_DIR": None,
-    "RESUME": True,          # bỏ qua subject đã xử lý xong
-    "N_JOBS": 2,             # số luồng cho filter/resample (Colab thường có 2 core)
+EXCLUDE_SUBJECTS = {"sub-02", "sub-14", "sub-17"}
 
+CHANNEL_ALIASES: Dict[str, str] = {
+    "TP9 LEFT EAR": "TP9",
+    "TP10 RIGHT EAR": "TP10",
+    "O9": "I1",
+    "O10": "I2",
+}
+
+# Thứ tự 127 kênh chuẩn của sub-01 sau khi chuẩn hóa 4 aliases
+CANONICAL_127_CHANNELS: List[str] = [
+    "Fp1", "Fz", "F3", "F7", "FT9", "FC5", "FC1", "C3", "T7", "TP9",
+    "CP5", "CP1", "Pz", "P3", "P7", "O1", "Oz", "O2", "P4", "P8",
+    "TP10", "CP6", "CP2", "Cz", "C4", "T8", "FT10", "FC6", "FC2", "F4",
+    "F8", "Fp2", "AF7", "AF3", "AFz", "F1", "F5", "FT7", "FC3", "C1",
+    "C5", "TP7", "CP3", "P1", "P5", "PO7", "PO3", "POz", "PO4", "PO8",
+    "P6", "P2", "CPz", "CP4", "TP8", "C6", "C2", "FC4", "FT8", "F6",
+    "AF8", "AF4", "F2", "F9", "AFF1h", "FFC1h", "FFC5h", "FTT7h", "FCC3h", "CCP1h",
+    "CCP5h", "TPP7h", "P9", "PPO9h", "PO9", "I1", "OI1h", "PPO1h", "CPP3h", "CPP4h",
+    "PPO2h", "OI2h", "I2", "PO10", "PPO10h", "P10", "TPP8h", "CCP6h", "CCP2h", "FCC4h",
+    "FTT8h", "FFC6h", "FFC2h", "AFF2h", "F10", "AFp1", "AFF5h", "FFT9h", "FFT7h", "FFC3h",
+    "FCC1h", "FCC5h", "FTT9h", "TTP7h", "CCP3h", "CPP1h", "CPP5h", "TPP9h", "POO9h", "PPO5h",
+    "POO1", "POO2", "PPO6h", "POO10h", "TPP10h", "CPP6h", "CPP2h", "CCP4h", "TTP8h", "FTT10h",
+    "FCC6h", "FCC2h", "FFC4h", "FFT8h", "FFT10h", "AFF6h", "AFp2",
+]
+
+METADATA_COLUMNS: List[str] = [
+    "trial_uid",
+    "subject_id",
+    "trial_idx",
+    "onset_sample",
+    "onset_sec",
+    "event_type",
+    "label",
+    "rt_ms",
+    "rt_group",
+]
+
+CONFIG: Dict[str, Any] = {
+    # Đường dẫn thư mục
+    "RAW_DIR": Path("data/raw/oddball_data"),
+    "PROCESSED_DIR": Path("data/processed"),
+    "FIGURES_DIR": Path("results/figures/ica"),
+
+    # Chính sách chọn lọc subject (Cohort Policy)
+    "EXCLUDE_SUBJECTS": sorted(EXCLUDE_SUBJECTS),
+
+    # Cắt đoạn bao quanh task trước khi lọc / ICA (cứu sub-08, sub-35)
+    "CROP_PAD_SEC": 5.0,
+
+    # Cấu hình Trigger / Event (Oddball: Frequent Standard vs Rare Target)
     "EVENT_TRIGGER_MAP": {
         "Frequent": "Stimulus/S  5",
         "Target": "Stimulus/S  6",
 
+    },
+    "BEHAVIOR": {
+        "rt_min_sec": 0.100,
+        "rt_max_sec": 1.500,
+        "rt_fast_ms": 450.0,
+        "rt_slow_ms": 550.0,
     },
 
     "RESPONSE_TRIGGER": "Stimulus/S  1",
@@ -76,21 +127,14 @@ CONFIG: Dict[str, Any] = {
 
     "BAD_CHANNELS": {
         "enabled": True,
-        "flat_threshold_std": 1e-7,
-        "noisy_threshold_z": 5.0,
-        "interpolate": True,
-        "max_bad_fraction": 0.10,    # cảnh báo nếu > 10% kênh hỏng
-        # Kênh trán có std lớn hơn một cách tự nhiên do chớp mắt -> nới ngưỡng noisy để không mất proxy EOG
-        "frontal_channels": ["Fp1", "Fp2", "Fpz", "AF3", "AF4", "AF7", "AF8", "AFz", "F7", "F8"],
-        "frontal_z_multiplier": 2.0,
+        "flat_threshold_std": 1e-7,    # Kênh phẳng: std < 0.1 µV
+        "noisy_threshold_z": 5.0,      # Kênh nhiễu: z-score MAD std > 5.0
+        "interpolate": True,           # Nội suy kênh hỏng TRƯỚC khi average reference
     },
 
-    "REFERENCE": "average",
-
-    "MONTAGE": {
-        "min_measured_coverage": 0.95,  # dùng tọa độ đo thực tế nếu phủ >= 95% số kênh EEG
-        "radius_range_m": (0.05, 0.15),  # bán kính trung vị hợp lệ của điện cực trên da đầu (m)
-    },
+    # Montage & Tham chiếu điện cực (Re-referencing)
+    "MONTAGE": "colin27_1005",
+    "REFERENCE": "average",            # Average reference toàn bộ điện cực chuẩn
 
     "ICA": {
         "method": "picard",          # "picard" (tự fallback "fastica") | "fastica" | "infomax"
@@ -122,12 +166,8 @@ CONFIG: Dict[str, Any] = {
         "reject_amp": 150e-6,
     },
 
-    "CHANNEL_ALIASES": {
-        "TP9 LEFT EAR": "TP9",
-        "TP10 RIGHT EAR": "TP10",
-        "O9": "I1",
-        "O10" : "I2",
-    },
+    # Ánh xạ tên kênh không chuẩn sang chuẩn quốc tế 10-05 / colin27_1005
+    "CHANNEL_ALIASES": dict(CHANNEL_ALIASES),
 
     "EXCLUDE_SUBJECTS": ["sub-02", "sub-14", "sub-17"],
 
@@ -139,7 +179,7 @@ CONFIG: Dict[str, Any] = {
 
 
 # ==============================================================================
-# 2. ĐƯỜNG DẪN & LOGGING
+# 2. HỆ THỐNG GHI NHẬT KÝ (LOGGING) & TIỆN ÍCH CHUNG
 # ==============================================================================
 def default_project_root() -> Path:
     """SỬA [6]: không crash khi chạy trong notebook (không có __file__)."""
@@ -194,11 +234,28 @@ def _jsonable(obj: Any) -> Any:
     return obj
 
 
-# ==============================================================================
-# 3. TIỆN ÍCH SỰ KIỆN
-# ==============================================================================
-def natural_sort_key(s: str) -> List[Any]:
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
+def _to_json_serializable(obj: Any) -> Any:
+    """Chuyển đổi Path, set, numpy scalar sang kiểu JSON hợp lệ."""
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, tuple):
+        return [_to_json_serializable(x) for x in obj]
+    if isinstance(obj, list):
+        return [_to_json_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    return obj
+
+
+def natural_sort_key(s: str) -> List[int | str]:
+    """Sắp xếp tự nhiên theo thứ tự số tăng dần."""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", str(s))]
 
 
 def extract_subject_id(vhdr_path: Path) -> str:
@@ -215,119 +272,283 @@ def normalize_event_name(name: str) -> str:
     return re.sub(r"\s+", "", name).lower()
 
 
+# ==============================================================================
+# 3. TIỆN ÍCH KÊNH CHUẨN, MONTAGE, SỰ KIỆN HÀNH VI & KÊNH XẤU
+# ==============================================================================
+def get_canonical_127_channels(
+    raw_dir: Path,
+    channel_aliases: Optional[Dict[str, str]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> List[str]:
+    """Lấy danh sách thứ tự 127 kênh chuẩn từ sub-01 (sau alias), fallback về hằng số."""
+    aliases = channel_aliases or CHANNEL_ALIASES
+    sub01_candidates = sorted(raw_dir.rglob("sub-01*_eeg.vhdr"), key=natural_sort_key)
+    if sub01_candidates:
+        raw_ref = mne.io.read_raw_brainvision(sub01_candidates[0], preload=False, verbose=False)
+        rename_dict = {orig: new for orig, new in aliases.items() if orig in raw_ref.ch_names}
+        if rename_dict:
+            raw_ref.rename_channels(rename_dict)
+        ch_order = list(raw_ref.ch_names)
+        if set(ch_order) == set(CANONICAL_127_CHANNELS) and len(ch_order) == 127:
+            return ch_order
+        if logger is not None:
+            logger.warning(
+                "Bộ kênh của sub-01 không khớp CANONICAL_127_CHANNELS; dùng hằng số mặc định."
+            )
+    return list(CANONICAL_127_CHANNELS)
+
+
+def validate_channels_tsv(
+    vhdr_path: Path,
+    raw_ch_names: Sequence[str],
+    logger: logging.Logger,
+) -> None:
+    """Đọc tệp _channels.tsv với encoding='latin1' để xác thực danh sách 127 kênh."""
+    sub_id = extract_subject_id(vhdr_path)
+    ch_tsv_candidates = sorted(vhdr_path.parent.glob("*_channels.tsv"))
+    if not ch_tsv_candidates:
+        return
+
+    df_ch = pd.read_csv(ch_tsv_candidates[0], sep="\t", encoding="latin1")
+    if "name" not in df_ch.columns:
+        logger.warning(f"[{sub_id}] {ch_tsv_candidates[0].name} thiếu cột 'name'.")
+        return
+
+    tsv_names = df_ch["name"].astype(str).tolist()
+    if len(tsv_names) != len(raw_ch_names) or tsv_names != list(raw_ch_names):
+        logger.warning(
+            f"[{sub_id}] Danh sách kênh trong {ch_tsv_candidates[0].name} "
+            f"({len(tsv_names)}) khác với .vhdr ({len(raw_ch_names)})."
+        )
+
+
+def normalize_boundary_annotations(
+    raw: mne.io.Raw,
+    logger: logging.Logger,
+    sub_id: str,
+) -> List[float]:
+    """Đổi annotation 'boundary'/'New Segment' (onset > 0.01s) thành 'BAD boundary'."""
+    if len(raw.annotations) == 0:
+        return []
+
+    onsets = np.asarray(raw.annotations.onset, dtype=np.float64)
+    durations = np.asarray(raw.annotations.duration, dtype=np.float64)
+    orig_descs = [str(d) for d in raw.annotations.description]
+
+    new_descs: List[str] = []
+    boundary_onsets: List[float] = []
+    for onset, desc in zip(onsets, orig_descs):
+        desc_lower = desc.lower()
+        if ("boundary" in desc_lower or "new segment" in desc_lower) and onset > 0.01:
+            new_descs.append("BAD boundary")
+            boundary_onsets.append(float(onset))
+        else:
+            new_descs.append(desc)
+
+    if boundary_onsets:
+        raw.set_annotations(
+            mne.Annotations(
+                onset=onsets,
+                duration=durations,
+                description=new_descs,
+                orig_time=raw.annotations.orig_time,
+            ),
+            verbose=False,
+        )
+        unique_boundaries = sorted(set(round(x, 6) for x in boundary_onsets))
+        logger.info(
+            f"[{sub_id}] Đánh dấu {len(unique_boundaries)} mốc ghép nối BAD boundary: "
+            f"{unique_boundaries}"
+        )
+        return unique_boundaries
+
+    return []
+
+
+def extract_behaviorally_clean_events(
+    events_tsv_path: Path,
+    sub_id: str,
+    vmrk_boundary_sec: Optional[List[float]] = None,
+    sfreq: float = 1000.0,
+    rt_min: float = 0.100,
+    rt_max: float = 1.500,
+    rt_fast_ms: float = 450.0,
+    rt_slow_ms: float = 550.0,
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    """Lọc hành vi chuẩn Oddball theo Mục 6.2.C của DATA_AUDIT_REPORT.md.
+
+    - Giữ `S  5` (Frequent CR, label=0) khi KHÔNG có `S  1` trong [0, 1.500] s trước
+      stimulus / break (`S 10`, `S 12`, boundary) tiếp theo (`rt_ms = np.nan`, `rt_group = 'na'`).
+    - Giữ `S  6` (Target Hit, label=1) khi có `S  1` đầu tiên thỏa `0.100 <= rt <= 1.500` s
+      trước stimulus / break kế tiếp (`rt_ms = rt * 1000.0`).
+    - Loại bỏ hoàn toàn Distractor (`S  7`), Target Miss, Anticipation (< 100 ms), Frequent FA.
+    - Trả về mảng MNE events (N, 3) dùng sample 0-based tại `sfreq` (mã 1=Frequent, 2=Target)
+      và DataFrame metadata chứa `trial_uid = f"{sub_id}_{onset_sample_1000hz}"`.
+    """
+    df = pd.read_csv(events_tsv_path, sep="\t")
+    stim_codes = {"S  5", "S  6", "S  7"}
+    break_codes = {"S 10", "S 12", "__BOUNDARY__"}
+
+    # Đọc timeline hợp nhất giữa _events.tsv và các mốc boundary từ .vmrk
+    timeline: List[Tuple[float, int, str]] = []
+    for _, row in df.iterrows():
+        onset_val = float(row["onset"])
+        code_val = str(row["event_type"])
+        priority = 0 if code_val in break_codes else 1
+        timeline.append((onset_val, priority, code_val))
+
+    for b_sec in vmrk_boundary_sec or []:
+        timeline.append((float(b_sec), 0, "__BOUNDARY__"))
+
+    timeline.sort(key=lambda item: (item[0], item[1]))
+    records = [(t, c) for t, _, c in timeline]
+    stim_idx = [i for i, (_, c) in enumerate(records) if c in stim_codes]
+
+    clean_events: List[List[int]] = []
+    meta_rows: List[Dict[str, Any]] = []
+    seen_uids = set()
+
+    for k, i in enumerate(stim_idx):
+        t_stim, code = records[i]
+        j_end = stim_idx[k + 1] if k + 1 < len(stim_idx) else len(records)
+        resps: List[float] = []
+        for j in range(i + 1, j_end):
+            t_j, c_j = records[j]
+            if c_j in break_codes:
+                break
+            if c_j == "S  1":
+                rt_sec = round(t_j - t_stim, 6)
+                if rt_sec >= 0.0:
+                    resps.append(rt_sec)
+
+        # BIDS _events.tsv lưu onset = (sample_1based) / 1000.0 -> trừ 1 để khớp mẫu 0-based của MNE
+        sample_0based = max(0, int(round(t_stim * sfreq)) - 1)
+        onset_sec = float(sample_0based / sfreq)
+        trial_uid = f"{sub_id}_{sample_0based}"
+
+        if code == "S  5" and not any(r <= rt_max for r in resps):
+            if trial_uid in seen_uids:
+                raise ValueError(f"[{sub_id}] Trùng trial_uid: {trial_uid}")
+            seen_uids.add(trial_uid)
+            clean_events.append([sample_0based, 0, 1])  # 1 -> Frequent (label 0)
+            meta_rows.append(
+                {
+                    "trial_uid": trial_uid,
+                    "subject_id": sub_id,
+                    "trial_idx": -1,
+                    "onset_sample": int(sample_0based),
+                    "onset_sec": onset_sec,
+                    "event_type": "Frequent",
+                    "label": 0,
+                    "rt_ms": np.nan,
+                    "rt_group": "na",
+                }
+            )
+        elif code == "S  6" and resps and (rt_min <= resps[0] <= rt_max):
+            if trial_uid in seen_uids:
+                raise ValueError(f"[{sub_id}] Trùng trial_uid: {trial_uid}")
+            seen_uids.add(trial_uid)
+            rt_ms = round(float(resps[0] * 1000.0), 3)
+            if rt_ms < rt_fast_ms:
+                rt_group = "fast"
+            elif rt_ms <= rt_slow_ms:
+                rt_group = "mid"
+            else:
+                rt_group = "slow"
+
+            clean_events.append([sample_0based, 0, 2])  # 2 -> Target (label 1)
+            meta_rows.append(
+                {
+                    "trial_uid": trial_uid,
+                    "subject_id": sub_id,
+                    "trial_idx": -1,
+                    "onset_sample": int(sample_0based),
+                    "onset_sec": onset_sec,
+                    "event_type": "Target",
+                    "label": 1,
+                    "rt_ms": rt_ms,
+                    "rt_group": rt_group,
+                }
+            )
+
+    if not clean_events:
+        raise ValueError(f"[{sub_id}] Không có trial hợp lệ nào sau lọc hành vi!")
+
+    events_arr = np.asarray(clean_events, dtype=np.int64)
+    df_meta = pd.DataFrame(meta_rows, columns=METADATA_COLUMNS)
+    return events_arr, df_meta
+
+
 def extract_events_safe(
     raw,
     trigger_map: Dict[str, str],
-    logger,
-    response_trigger: Optional[str] = None,
-    rt_window_ms: Tuple[float, float] = (150.0, 1500.0),
-) -> Tuple[np.ndarray, Dict[str, int], np.ndarray]:
-    """Khớp trigger, lọc hành vi (Target Hit & Frequent CR) và tính rt_ms."""
+    logger: logging.Logger,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Giữ lại helper cũ để bảo đảm tương thích ngược nếu module khác gọi trực tiếp."""
     _, event_dict = mne.events_from_annotations(raw, verbose=False)
-    mapping = {}
-    for class_name, pattern in trigger_map.items():
-        code = 1 if class_name == "Frequent" else 2
-        if pattern in event_dict:
-            mapping[pattern] = code
+
+    mne_target_mapping = {}
+    for class_name, trigger_pattern in trigger_map.items():
+        target_code = 1 if class_name == "Frequent" else 2
+
+        if trigger_pattern in event_dict:
+            mne_target_mapping[trigger_pattern] = target_code
             continue
-        norm = normalize_event_name(pattern)
-        matches = [a for a in event_dict if normalize_event_name(a) == norm]
+
+        norm_pattern = normalize_event_name(trigger_pattern)
+        matches = [
+            annot for annot in event_dict
+            if normalize_event_name(annot) == norm_pattern
+        ]
+
         if len(matches) == 1:
             mapping[matches[0]] = code
         else:
-            msg = (f"LỖI GÁN NHÃN: Trigger '{class_name}' (pattern='{pattern}') không khớp duy nhất! "
-                   f"Tìm thấy {len(matches)}: {matches}. Annotations trong file: {list(event_dict.keys())}")
-            logger.error(msg)
-            raise ValueError(msg)
+            err_msg = (
+                f"LỖI GÁN NHÃN: Trigger '{class_name}' (pattern='{trigger_pattern}') "
+                f"không khớp duy nhất! Tìm thấy {len(matches)} kết quả: {matches}."
+            )
+            logger.error(err_msg)
+            raise ValueError(err_msg)
 
-    # Nếu không truyền response_trigger thì giữ nguyên hành vi cũ
-    if not response_trigger:
-        events, _ = mne.events_from_annotations(raw, event_id=mapping, verbose=False)
-        return events, {"Frequent": 1, "Target": 2}, np.full(len(events), np.nan, dtype=np.float32)
-
-    # Tìm marker phản hồi (Response)
-    if response_trigger in event_dict:
-        mapping[response_trigger] = 99
-    else:
-        norm_r = normalize_event_name(response_trigger)
-        matches_r = [a for a in event_dict if normalize_event_name(a) == norm_r]
-        if len(matches_r) == 1:
-            mapping[matches_r[0]] = 99
-        else:
-            msg = (f"LỖI GÁN NHÃN: Response trigger '{response_trigger}' không khớp duy nhất! "
-                   f"Tìm thấy {len(matches_r)}: {matches_r}. Annotations: {list(event_dict.keys())}")
-            logger.error(msg)
-            raise ValueError(msg)
-
-    all_events, _ = mne.events_from_annotations(raw, event_id=mapping, verbose=False)
-    sfreq = raw.info["sfreq"]
-    rt_min_samp = int(round(rt_window_ms[0] * sfreq / 1000.0))
-    rt_max_samp = int(round(rt_window_ms[1] * sfreq / 1000.0))
-
-    stim_events = all_events[np.isin(all_events[:, 2], [1, 2])]
-    resp_samples = all_events[all_events[:, 2] == 99, 0]
-
-    kept_events = []
-    kept_rt_ms = []
-    for ev in stim_events:
-        s_stim, code = ev[0], ev[2]
-        # Tìm nút bấm đầu tiên nằm trong cửa sổ [rt_min, rt_max]
-        idx = np.searchsorted(resp_samples, s_stim + rt_min_samp, side="left")
-        has_resp = idx < len(resp_samples) and (resp_samples[idx] - s_stim) <= rt_max_samp
-
-        if code == 2 and has_resp:  # Target Hit -> giữ và tính rt_ms
-            kept_events.append(ev)
-            kept_rt_ms.append((resp_samples[idx] - s_stim) * 1000.0 / sfreq)
-        elif code == 1 and not has_resp:  # Frequent CR -> giữ, rt_ms = NaN
-            kept_events.append(ev)
-            kept_rt_ms.append(np.nan)
-
-    events = np.array(kept_events, dtype=np.int64) if kept_events else np.empty((0, 3), dtype=np.int64)
-    rt_ms = np.array(kept_rt_ms, dtype=np.float32)
-    return events, {"Frequent": 1, "Target": 2}, rt_ms
+    events, _ = mne.events_from_annotations(raw, event_id=mne_target_mapping, verbose=False)
+    mne_event_id = {"Frequent": 1, "Target": 2}
+    return events, mne_event_id
 
 
-# ==============================================================================
-# 4. MONTAGE (SỬA [1])
-# ==============================================================================
-def _read_bids_electrodes(tsv: Path, coordsystem: Optional[Path], aliases: Dict[str, str]) -> Dict[str, np.ndarray]:
-    df = pd.read_csv(tsv, sep="\t")
-    cols = {c.lower(): c for c in df.columns}
-    if not {"name", "x", "y", "z"}.issubset(cols):
-        raise ValueError(f"electrodes.tsv thiếu cột name/x/y/z (có: {list(df.columns)})")
-    scale = 1.0
-    if coordsystem is not None and coordsystem.exists():
-        meta = json.loads(coordsystem.read_text(encoding="utf-8"))
-        unit = str(meta.get("EEGCoordinateUnits", meta.get("iEEGCoordinateUnits", "m"))).lower()
-        scale = {"m": 1.0, "cm": 1e-2, "mm": 1e-3}.get(unit, 1.0)
-    out = {}
-    for _, r in df.iterrows():
-        xyz = pd.to_numeric(pd.Series([r[cols["x"]], r[cols["y"]], r[cols["z"]]]), errors="coerce").to_numpy(float)
-        if np.all(np.isfinite(xyz)):
-            name = aliases.get(str(r[cols["name"]]), str(r[cols["name"]]))
-            out[name] = xyz * scale
-    return out
+def setup_channel_montage(
+    raw: mne.io.Raw,
+    vhdr_path: Path,
+    channel_aliases: Dict[str, str],
+    logger: logging.Logger,
+    montage_name: str = "colin27_1005",
+) -> List[str]:
+    """Chuẩn hóa đủ 4 tên kênh alias và gán montage colin27_1005 (on_missing='raise')."""
+    rename_dict = {
+        orig: new for orig, new in channel_aliases.items()
+        if orig in raw.ch_names
+    }
+    if rename_dict:
+        raw.rename_channels(rename_dict)
+        logger.debug(f"Đã chuẩn hóa tên kênh: {rename_dict}")
 
+    sub_id = extract_subject_id(vhdr_path)
+    montage = mne.channels.make_standard_montage(montage_name)
+    raw.set_montage(montage, on_missing="raise", verbose=False)
 
-def _measured_positions(sub_dir: Path, sub_id: str, aliases: Dict[str, str], logger) -> Tuple[Dict[str, np.ndarray], str]:
-    tsvs = sorted(sub_dir.glob(f"*{sub_id}*electrodes.tsv")) or sorted(sub_dir.glob("*electrodes.tsv"))
-    if tsvs:
-        cs = sorted(sub_dir.glob(f"*{sub_id}*coordsystem.json")) or sorted(sub_dir.glob("*coordsystem.json"))
-        try:
-            pos = _read_bids_electrodes(tsvs[0], cs[0] if cs else None, aliases)
-            return pos, f"measured:{tsvs[0].name}"
-        except Exception as e:
-            logger.warning(f"[{sub_id}] Không đọc được {tsvs[0].name}: {e}")
-    bvct = sorted(sub_dir.glob("*.bvct"))
-    if bvct:
-        try:
-            m = mne.channels.read_dig_captrak(bvct[0])
-            pos = {aliases.get(k, k): np.asarray(v) for k, v in m.get_positions()["ch_pos"].items()}
-            return pos, f"measured:{bvct[0].name}"
-        except Exception as e:
-            logger.warning(f"[{sub_id}] Không đọc được {bvct[0].name}: {e}")
-    return {}, ""
+    eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
+    no_position_chs: List[str] = []
+    for idx in eeg_picks:
+        ch = raw.info["chs"][idx]
+        pos = ch["loc"][:3]
+        if not np.all(np.isfinite(pos)) or np.linalg.norm(pos) < 1e-10:
+            no_position_chs.append(ch["ch_name"])
 
+    if no_position_chs:
+        raise ValueError(
+            f"[{sub_id}] Phát hiện {len(no_position_chs)} kênh thiếu tọa độ 3D "
+            f"sau gán montage '{montage_name}': {no_position_chs}"
+        )
 
 def template_montage():
     """Montage 10-05 mẫu. MNE >= 1.13 đã deprecate 'standard_1005' (thay bằng 'colin27_1005')."""
@@ -336,143 +557,71 @@ def template_montage():
     return mne.channels.make_standard_montage(name), name
 
 
-def setup_channel_montage(raw, vhdr_path: Path, channel_aliases: Dict[str, str], logger,
-                          montage_cfg: Optional[Dict] = None) -> Tuple[List[str], str]:
-    """Đổi tên kênh alias, gán tọa độ (đo thực tế nếu hợp lệ, ngược lại standard_1005).
-
-    Trả về (danh sách kênh không có tọa độ, nguồn montage).
-    """
-    montage_cfg = montage_cfg or CONFIG["MONTAGE"]
-    rename = {o: n for o, n in channel_aliases.items() if o in raw.ch_names}
-    if rename:
-        raw.rename_channels(rename)
-
-    sub_id = extract_subject_id(vhdr_path)
-    eeg_names = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
-
-    source = "template"
-    montage = None
-    measured, tag = _measured_positions(vhdr_path.parent, sub_id, channel_aliases, logger)
-    if measured:
-        covered = [c for c in eeg_names if c in measured]
-        coverage = len(covered) / max(len(eeg_names), 1)
-        radii = np.linalg.norm(np.array([measured[c] for c in covered]), axis=1) if covered else np.array([0.0])
-        r_lo, r_hi = montage_cfg["radius_range_m"]
-        if coverage >= montage_cfg["min_measured_coverage"] and r_lo <= float(np.median(radii)) <= r_hi:
-            montage = mne.channels.make_dig_montage(ch_pos={c: measured[c] for c in covered}, coord_frame="head")
-            source = tag
-        else:
-            logger.warning(
-                f"[{sub_id}] Tọa độ đo thực tế bị từ chối (phủ {coverage:.0%}, bán kính trung vị "
-                f"{np.median(radii):.4f} m, kỳ vọng {r_lo}-{r_hi} m; kiểm tra đơn vị/hệ tọa độ). Dùng montage mẫu 10-05."
-            )
-    if montage is None:
-        montage, tname = template_montage()
-        source = f"template:{tname}"
-
-    raw.set_montage(montage, on_missing="ignore", verbose=False)
-
-    no_pos = []
-    for idx in mne.pick_types(raw.info, eeg=True, exclude=[]):
-        pos = raw.info["chs"][idx]["loc"][:3]
-        if not np.all(np.isfinite(pos)) or np.linalg.norm(pos) < 1e-10:
-            no_pos.append(raw.info["chs"][idx]["ch_name"])
-    if no_pos:
-        logger.warning(f"[{sub_id}] {len(no_pos)} kênh không có tọa độ ({source}): {no_pos}")
-    return no_pos, source
-
-
-# ==============================================================================
-# 5. NHIỄU LƯỚI, KÊNH HỎNG
-# ==============================================================================
-def measure_line_noise_db(raw, line_freq: float, max_sec: float) -> Optional[float]:
-    """Độ nổi (dB) của đỉnh nhiễu lưới so với phổ lân cận, trên dữ liệu CHƯA lọc."""
-    sfreq = raw.info["sfreq"]
-    if line_freq + 8 >= sfreq / 2:
-        return None
-    tmax = min(max_sec, raw.times[-1])
-    n_fft = int(min(sfreq * 4, tmax * sfreq))
-    psd = raw.compute_psd(method="welch", fmin=line_freq - 8, fmax=line_freq + 8, tmax=tmax,
-                          picks="eeg", n_fft=n_fft, verbose=False)
-    data, freqs = psd.get_data(return_freqs=True)
-    db = (10 * np.log10(np.maximum(data, 1e-30))).mean(axis=0)
-    d = np.abs(freqs - line_freq)
-    on, off = d <= 0.5, (d >= 2.0) & (d <= 6.0)
-    if not on.any() or not off.any():
-        return None
-    return float(db[on].max() - np.median(db[off]))
-
-
-def fir_attenuation_db(sfreq: float, l_freq: float, h_freq: float, at_freq: float) -> float:
-    h = mne.filter.create_filter(None, sfreq, l_freq, h_freq, method="fir", phase="zero",
-                                 fir_design="firwin", verbose=False)
-    _, resp = freqz(h, worN=[2 * np.pi * at_freq / sfreq])
-    return float(20 * np.log10(max(abs(resp[0]), 1e-12)))
-
-
-def decide_notch(raw, fcfg: Dict, logger, sub_id: str) -> Tuple[bool, Optional[float], Optional[float]]:
-    mode = fcfg.get("notch_mode", "auto")
-    if mode == "never":
-        return False, None, None
-    prom = measure_line_noise_db(raw, fcfg["notch_freq"], fcfg["line_noise_max_sec"])
-    if mode == "always":
-        return True, prom, None
-    if prom is None:
-        return False, None, None
-    atten = fir_attenuation_db(raw.info["sfreq"], fcfg["l_freq"], fcfg["h_freq"], fcfg["notch_freq"])
-    residual = prom + atten
-    apply = residual > fcfg["notch_residual_db"]
-    logger.info(f"[{sub_id}] Nhiễu {fcfg['notch_freq']:.0f} Hz: nổi {prom:.1f} dB, bandpass suy giảm {atten:.1f} dB "
-                f"-> còn {residual:.1f} dB => {'CẦN' if apply else 'KHÔNG cần'} notch.")
-    return apply, prom, residual
-
-
-def detect_and_handle_bad_channels(raw, cfg: Dict, logger, sub_id: str) -> List[str]:
-    """SỬA [1]: KHÔNG còn miễn trừ kênh thiếu tọa độ khỏi việc phát hiện kênh hỏng."""
-    if not cfg.get("enabled", True):
+def detect_and_handle_bad_channels(
+    raw: mne.io.Raw,
+    config_bads: Dict[str, Any],
+    logger: logging.Logger,
+    sub_id: str,
+    no_position_chs: Optional[List[str]] = None,
+) -> List[str]:
+    """Tự động phát hiện kênh hỏng (flat / noisy) TRƯỚC KHI Average Reference."""
+    if not config_bads.get("enabled", True):
         return []
-    picks = mne.pick_types(raw.info, eeg=True, exclude=[])
-    names = [raw.ch_names[p] for p in picks]
-    data = raw.get_data(picks=picks)
-    # Phân vị 25% của std theo cửa sổ 2 s: bền với chớp mắt/nhiễu thoáng qua (std toàn bản ghi sẽ khiến Fp1/Fp2
-    # bị đánh dấu "noisy" chỉ vì chớp mắt, làm mất kênh proxy EOG cho bước ICA).
-    win = int(2 * raw.info["sfreq"])
-    n_win = data.shape[1] // win
-    if n_win >= 5:
-        stds = np.percentile(data[:, : n_win * win].reshape(len(picks), n_win, win).std(axis=2), 25, axis=1)
-    else:
-        stds = data.std(axis=1)
-    del data
-    med = np.median(stds)
-    mad = np.median(np.abs(stds - med))
+
+    _no_pos = set(no_position_chs or [])
+    eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
+    data = raw.get_data(picks=eeg_picks)
+    ch_names = [raw.ch_names[p] for p in eeg_picks]
+    stds = np.std(data, axis=1)
+
+    flat_thresh = float(config_bads.get("flat_threshold_std", 1e-7))
+    noisy_z_thresh = float(config_bads.get("noisy_threshold_z", 5.0))
+
+    valid_stds = np.array([s for ch, s in zip(ch_names, stds) if ch not in _no_pos])
+    median_std = float(np.median(valid_stds)) if len(valid_stds) > 0 else float(np.median(stds))
+    mad = float(np.median(np.abs(valid_stds - median_std))) if len(valid_stds) > 0 else 0.0
     if mad <= 1e-12:
         logger.warning(f"[{sub_id}] MAD ≈ 0. Bỏ qua phát hiện noisy channels.")
         z = np.zeros_like(stds)
     else:
-        z = 0.6745 * (stds - med) / mad
-    bads = []
-    front_set = set(cfg.get("frontal_channels", []))
-    for ch, s, zz in zip(names, stds, z):
-        if s < cfg["flat_threshold_std"]:
-            bads.append(ch)
-            logger.warning(f"[{sub_id}] FLAT channel: {ch} (std={s * 1e6:.3f} µV)")
-        elif zz > cfg["noisy_threshold_z"] * (cfg.get("frontal_z_multiplier", 1.0) if ch in front_set else 1.0):
-            bads.append(ch)
-            logger.warning(f"[{sub_id}] NOISY channel: {ch} (z={zz:.2f})")
-    raw.info["bads"] = sorted(set(raw.info["bads"]) | set(bads))
-    if len(bads) / max(len(names), 1) > cfg.get("max_bad_fraction", 0.1):
-        logger.warning(f"[{sub_id}] CẢNH BÁO: {len(bads)}/{len(names)} kênh hỏng (> {cfg['max_bad_fraction']:.0%}).")
-    return bads
+        z_scores = 0.6745 * (stds - median_std) / mad
+
+    bad_channels: List[str] = []
+    for ch, std, z_score in zip(ch_names, stds, z_scores):
+        if ch in _no_pos:
+            continue
+
+        if std < flat_thresh:
+            bad_channels.append(ch)
+            logger.warning(f"[{sub_id}] FLAT channel: {ch} (std={std * 1e6:.3f} µV)")
+        elif z_score > noisy_z_thresh:
+            bad_channels.append(ch)
+            logger.warning(
+                f"[{sub_id}] NOISY channel: {ch} (std={std * 1e6:.1f} µV, z-score={z_score:.2f})"
+            )
+
+    raw.info["bads"] = sorted(set(raw.info["bads"] + bad_channels))
+    return sorted(set(bad_channels))
 
 
-def parse_drop_log_reasons(epochs) -> Dict[str, int]:
-    """Phân loại nguyên nhân loại epoch (epochs không dùng reject biên độ)."""
-    out = {"annotation_rejected": 0, "boundary_or_other": 0}
+def parse_drop_log_reasons(epochs: mne.Epochs, raw: mne.io.Raw) -> Dict[str, int]:
+    """Phân loại chính xác nguyên nhân loại bỏ từng epoch theo epochs.drop_log."""
+    reasons = {
+        "initial_events": len(epochs.drop_log),
+        "kept_epochs": len(epochs),
+        "amplitude_rejected": 0,
+        "annotation_rejected": 0,
+        "boundary_or_other": 0,
+    }
+    raw_ch_names_set = set(raw.ch_names)
+
     for drop in epochs.drop_log:
         if len(drop) == 0:
             continue
-        if any("BAD" in str(i).upper() for i in drop):
-            out["annotation_rejected"] += 1
+        if any(item in raw_ch_names_set for item in drop):
+            reasons["amplitude_rejected"] += 1
+        elif any("BAD" in str(item).upper() or "BOUNDARY" in str(item).upper() for item in drop):
+            reasons["annotation_rejected"] += 1
         else:
             out["boundary_or_other"] += 1
     return out
@@ -554,221 +703,388 @@ def p300_effect(epochs, channels: List[str], window: Tuple[float, float]) -> Opt
 
 
 # ==============================================================================
-# 7. XỬ LÝ 1 SUBJECT (ghi thẳng ra đĩa, trả về stats nhỏ)
+# 4. QUY TRÌNH TIỀN XỬ LÝ CHO MỘT ĐỐI TƯỢNG (WORKER) + CACHING
 # ==============================================================================
-def _subject_files(sub_dir: Path, sub_id: str) -> Dict[str, Path]:
-    return {
-        "X_clean": sub_dir / f"{sub_id}_X_clean.npy",
-        "y_clean": sub_dir / f"{sub_id}_y_clean.npy",
-        "X_a": sub_dir / f"{sub_id}_X_no_ica.npy",
-        "X_b": sub_dir / f"{sub_id}_X_ica_all.npy",
-        "y_all": sub_dir / f"{sub_id}_y_all.npy",
-        "keep": sub_dir / f"{sub_id}_keep.npy",
-        "meta": sub_dir / f"{sub_id}_meta.csv",
-        "stats": sub_dir / f"{sub_id}_stats.json",
+def _locate_events_tsv(vhdr_path: Path, sub_id: str) -> Path:
+    """Tìm tệp _events.tsv tương ứng của subject."""
+    preferred = vhdr_path.parent / f"{sub_id}_task-oddball_events.tsv"
+    if preferred.exists():
+        return preferred
+    candidates = sorted(vhdr_path.parent.glob("*_events.tsv"))
+    if candidates:
+        return candidates[0]
+    raise FileNotFoundError(f"[{sub_id}] Không tìm thấy tệp _events.tsv trong {vhdr_path.parent}")
+
+
+def _save_subject_cache(
+    cache_path: Path,
+    X_clean: np.ndarray,
+    y_clean: np.ndarray,
+    X_no_ica: np.ndarray,
+    y_no_ica: np.ndarray,
+    meta_clean: pd.DataFrame,
+    meta_no_ica: pd.DataFrame,
+    stats: Dict[str, Any],
+    channel_names: List[str],
+) -> None:
+    """Lưu cache từng subject theo cách atomic vào file .npz."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(".tmp.npz")
+    payload = {
+        "X_clean": X_clean.astype(np.float32),
+        "y_clean": y_clean.astype(np.int64),
+        "X_no_ica": X_no_ica.astype(np.float32),
+        "y_no_ica": y_no_ica.astype(np.int64),
+        "meta_clean_json": np.array(meta_clean.to_json(orient="records")),
+        "meta_no_ica_json": np.array(meta_no_ica.to_json(orient="records")),
+        "stats_json": np.array(json.dumps(_to_json_serializable(stats))),
+        "channel_names": np.array(channel_names),
     }
+    with open(tmp_path, "wb") as f:
+        np.savez(f, **payload)
+    tmp_path.replace(cache_path)
 
 
-def process_single_subject(vhdr_path: Path, config: Dict, reference_channel_order: List[str],
-                           logger, out_dir: Path) -> Dict[str, Any]:
-    t0 = time.time()
+def _load_subject_cache(
+    cache_path: Path,
+    expected_channels: List[str],
+    expected_n_times: int,
+) -> Optional[Dict[str, Any]]:
+    """Nạp cache subject nếu tồn tại và khớp schema (127 kênh, 251 mẫu)."""
+    if not cache_path.exists():
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as data:
+            cached_channels = data["channel_names"].tolist()
+            if cached_channels != expected_channels:
+                return None
+            X_clean = np.asarray(data["X_clean"], dtype=np.float32)
+            y_clean = np.asarray(data["y_clean"], dtype=np.int64)
+            X_no_ica = np.asarray(data["X_no_ica"], dtype=np.float32)
+            y_no_ica = np.asarray(data["y_no_ica"], dtype=np.int64)
+            if X_clean.ndim != 3 or X_clean.shape[1:] != (len(expected_channels), expected_n_times):
+                return None
+            meta_clean_records = json.loads(str(data["meta_clean_json"].item()))
+            meta_no_ica_records = json.loads(str(data["meta_no_ica_json"].item()))
+            stats = json.loads(str(data["stats_json"].item()))
+
+        meta_clean = pd.DataFrame(meta_clean_records, columns=METADATA_COLUMNS)
+        meta_no_ica = pd.DataFrame(
+            meta_no_ica_records, columns=METADATA_COLUMNS + ["kept_in_clean"]
+        )
+        meta_no_ica["kept_in_clean"] = meta_no_ica["kept_in_clean"].astype(bool)
+        return {
+            "X_clean": X_clean,
+            "y_clean": y_clean,
+            "X_no_ica": X_no_ica,
+            "y_no_ica": y_no_ica,
+            "meta_clean": meta_clean,
+            "meta_no_ica": meta_no_ica,
+            "stats": stats,
+        }
+    except Exception:
+        return None
+
+
+def process_single_subject(
+    vhdr_path: Path,
+    config: Dict[str, Any],
+    reference_channel_order: List[str],
+    logger: logging.Logger,
+    save_diag: bool = False,
+) -> Tuple[mne.Epochs, Optional[mne.Epochs], pd.DataFrame, Optional[pd.DataFrame], Dict[str, Any]]:
+    """Thực hiện tiền xử lý chuẩn Data Contract cho 1 subject."""
     sub_id = extract_subject_id(vhdr_path)
+    events_tsv_path = _locate_events_tsv(vhdr_path, sub_id)
     logger.info(f"--- BẮT ĐẦU XỬ LÝ: {sub_id} ({vhdr_path.name}) ---")
     n_jobs = config.get("N_JOBS", 1)
     fcfg, ica_cfg, ecfg = config["FILTER"], config["ICA"], config["EPOCHS"]
     files = _subject_files(out_dir / "subjects", sub_id)
     files["stats"].parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Đọc, chuẩn hóa tên kênh, montage
+    # 1. Đọc dữ liệu thô & kiểm tra _channels.tsv (Latin-1)
     raw = mne.io.read_raw_brainvision(vhdr_path, preload=True, verbose=False)
-    orig_sfreq = raw.info["sfreq"]
-    no_pos, montage_source = setup_channel_montage(raw, vhdr_path, config["CHANNEL_ALIASES"], logger, config["MONTAGE"])
+    orig_sfreq = float(raw.info["sfreq"])
+    validate_channels_tsv(vhdr_path, raw.ch_names, logger)
 
-    # 2. Đồng bộ thứ tự kênh
-    if set(raw.ch_names) != set(reference_channel_order):
-        missing = set(reference_channel_order) - set(raw.ch_names)
-        extra = set(raw.ch_names) - set(reference_channel_order)
-        msg = f"[{sub_id}] Bộ kênh không đồng nhất! Thiếu: {missing}, Thừa: {extra}"
-        logger.error(msg)
-        raise ValueError(msg)
+    # 2. Đánh dấu các mốc boundary / New Segment giữa bản ghi thành 'BAD boundary'
+    boundary_onsets_sec = normalize_boundary_annotations(raw, logger, sub_id)
+
+    # 3. BẮT BUỘC: raw.crop() về cửa sổ task TRƯỚC lọc, tìm kênh xấu & ICA (cứu sub-08, sub-35)
+    ev_df = pd.read_csv(events_tsv_path, sep="\t")
+    stim_mask = ev_df["event_type"].astype(str).isin(["S  5", "S  6", "S  7"])
+    stim_onsets = ev_df.loc[stim_mask, "onset"].astype(float)
+    if stim_onsets.empty:
+        raise ValueError(f"[{sub_id}] Không tìm thấy kích thích S  5 / S  6 / S  7 trong {events_tsv_path.name}")
+
+    pad_sec = float(config.get("CROP_PAD_SEC", 5.0))
+    crop_tmin = max(0.0, float(stim_onsets.min()) - pad_sec)
+    crop_tmax = min(float(raw.times[-1]), float(stim_onsets.max()) + pad_sec)
+    raw.crop(tmin=crop_tmin, tmax=crop_tmax)
+    logger.info(
+        f"[{sub_id}] Đã raw.crop([{crop_tmin:.2f}s, {crop_tmax:.2f}s]) "
+        f"(first_samp={raw.first_samp}, n_times={raw.n_times})."
+    )
+
+    # 4. Đổi tên đủ 4 aliases & gán montage colin27_1005 (on_missing='raise') + đồng bộ 127 kênh
+    no_position_chs = setup_channel_montage(
+        raw,
+        vhdr_path,
+        config["CHANNEL_ALIASES"],
+        logger,
+        montage_name=config.get("MONTAGE", "colin27_1005"),
+    )
+
+    current_chs = set(raw.ch_names)
+    expected_chs = set(reference_channel_order)
+    if current_chs != expected_chs:
+        missing = expected_chs - current_chs
+        extra = current_chs - expected_chs
+        raise ValueError(f"[{sub_id}] Bộ kênh không đồng nhất! Thiếu: {missing}, Thừa: {extra}")
+
     raw.reorder_channels(reference_channel_order)
 
-    # 3. Lấy events gốc -> CROP trước khi resample & filter
-    events_raw, _, _ = extract_events_safe(raw, config["EVENT_TRIGGER_MAP"], logger)
-    
-    # Cắt bỏ phần đầu/cuối thừa (tránh đoạn rút mũ bão hòa ở sub-08, sub-35)
-    t_first = events_raw[0, 0] / orig_sfreq
-    t_last = events_raw[-1, 0] / orig_sfreq
-    tmin_crop = max(0.0, t_first - 5.0)
-    tmax_crop = min(raw.times[-1], t_last + 5.0)
-    logger.info(f"[{sub_id}] Crop tín hiệu về [{tmin_crop:.2f}s, {tmax_crop:.2f}s] (gốc: {raw.times[-1]:.2f}s)")
-    raw.crop(tmin=tmin_crop, tmax=tmax_crop)
-    
-    # Lấy lại events sau khi crop (kèm lọc hành vi Target Hit / Frequent CR và tính rt_ms)
-    events, event_id, rt_ms_all = extract_events_safe(
+    # 5. Phát hiện và nội suy kênh xấu SAU đổi tên/montage, TRƯỚC filter/resample và Average Reference
+    bad_channels = detect_and_handle_bad_channels(
         raw,
-        config["EVENT_TRIGGER_MAP"],
+        config["BAD_CHANNELS"],
         logger,
-        response_trigger=config.get("RESPONSE_TRIGGER"),
-        rt_window_ms=config.get("RT_WINDOW_MS", (150.0, 1500.0)),
+        sub_id,
+        no_position_chs=no_position_chs,
     )
-    if orig_sfreq != config["RESAMPLE_FREQ"]:
-        logger.info(f"[{sub_id}] Resample {orig_sfreq:g} -> {config['RESAMPLE_FREQ']:g} Hz (cùng events)...")
-        raw, events = raw.resample(config["RESAMPLE_FREQ"], events=events, npad="auto", n_jobs=n_jobs, verbose=False)
+    if config["BAD_CHANNELS"].get("interpolate", True) and len(raw.info["bads"]) > 0:
+        logger.info(f"[{sub_id}] Nội suy {len(raw.info['bads'])} kênh xấu trước Average Reference: {raw.info['bads']}")
+        raw.interpolate_bads(reset_bads=True, verbose=False)
+    else:
+        logger.info(f"[{sub_id}] Không phát hiện kênh xấu cần nội suy.")
 
-    # 4. Nhiễu lưới -> bandpass -> (notch nếu cần)  (SỬA [4])
-    use_notch, line_prom, line_resid = decide_notch(raw, fcfg, logger, sub_id)
-    raw.filter(fcfg["l_freq"], fcfg["h_freq"], picks="eeg", method="fir", phase="zero", n_jobs=n_jobs, verbose=False)
-    if use_notch:
-        raw.notch_filter(fcfg["notch_freq"], picks="eeg", method="fir", phase="zero", n_jobs=n_jobs, verbose=False)
+    # 6. Lọc hành vi chính xác ở 1000 Hz & tạo trial_uid = f"{sub_id}_{onset_sample_1000hz}"
+    beh_cfg = config.get("BEHAVIOR", {})
+    events_1000hz, df_events_meta = extract_behaviorally_clean_events(
+        events_tsv_path=events_tsv_path,
+        sub_id=sub_id,
+        vmrk_boundary_sec=boundary_onsets_sec,
+        sfreq=orig_sfreq,
+        rt_min=float(beh_cfg.get("rt_min_sec", 0.100)),
+        rt_max=float(beh_cfg.get("rt_max_sec", 1.500)),
+        rt_fast_ms=float(beh_cfg.get("rt_fast_ms", 450.0)),
+        rt_slow_ms=float(beh_cfg.get("rt_slow_ms", 550.0)),
+    )
+    n_behavior_clean = int(len(df_events_meta))
 
-    # 5. Kênh hỏng -> average reference (bỏ kênh hỏng) -> nội suy
-    bad_channels = detect_and_handle_bad_channels(raw, config["BAD_CHANNELS"], logger, sub_id)
-    logger.info(f"[{sub_id}] Bad channels trước reference: {raw.info['bads']}")
+    # Kiểm chứng chắc chắn toàn bộ events nằm trong [raw.first_samp, raw.last_samp]
+    if events_1000hz[:, 0].min() < raw.first_samp or events_1000hz[:, 0].max() > raw.last_samp:
+        raise RuntimeError(
+            f"[{sub_id}] Lỗi căn chỉnh mẫu sau crop: events trong "
+            f"[{events_1000hz[:, 0].min()}, {events_1000hz[:, 0].max()}] ngoài "
+            f"[{raw.first_samp}, {raw.last_samp}]"
+        )
+
+    # 7. Resample đồng bộ về 250 Hz (với anti-aliasing chuẩn MNE) TRƯỚC bước Filter & ICA
+    resample_freq = float(config["RESAMPLE_FREQ"])
+    if orig_sfreq != resample_freq:
+        logger.info(f"[{sub_id}] Resampling đồng bộ tín hiệu & events: {orig_sfreq} Hz -> {resample_freq} Hz...")
+        raw, events_res = raw.resample(resample_freq, events=events_1000hz, verbose=False)
+    else:
+        events_res = events_1000hz.copy()
+
+    # 8. Lọc Notch 50 Hz & Bandpass 0.5 - 40 Hz ở 250 Hz
+    filter_cfg = config["FILTER"]
+    if filter_cfg.get("use_notch", True):
+        raw.notch_filter(
+            freqs=filter_cfg["notch_freq"],
+            picks="eeg",
+            method="fir",
+            phase="zero",
+            verbose=False,
+        )
+
+    raw.filter(
+        l_freq=filter_cfg["l_freq"],
+        h_freq=filter_cfg["h_freq"],
+        picks="eeg",
+        method="fir",
+        phase="zero",
+        verbose=False,
+    )
+
+    # 9. Đặt Average Reference & khóa lại thứ tự 127 kênh chuẩn
     raw.set_eeg_reference(ref_channels=config["REFERENCE"], projection=False, verbose=False)
+    raw.reorder_channels(reference_channel_order)
 
-    unrecoverable: List[str] = []
-    n_interp = 0
-    if raw.info["bads"]:
-        if config["BAD_CHANNELS"].get("interpolate", True):
-            unrecoverable = [c for c in raw.info["bads"] if c in set(no_pos)]
-            interp = [c for c in raw.info["bads"] if c not in set(no_pos)]
-            if interp:
-                raw.info["bads"] = interp
-                raw.interpolate_bads(reset_bads=True, verbose=False)
-                n_interp = len(interp)
-            if unrecoverable:
-                # Không có tọa độ -> không nội suy được: đặt về 0 (kênh bị loại, shape giữ nguyên 127)
-                logger.warning(f"[{sub_id}] Kênh hỏng không có tọa độ, đặt về 0: {unrecoverable}")
-                raw._data[[raw.ch_names.index(c) for c in unrecoverable], :] = 0.0
-            raw.info["bads"] = []
-        else:
-            raw.info["bads"] = []
+    post_filter_std_uv = float(np.median(np.std(raw.get_data(picks="eeg"), axis=1)) * 1e6)
+    logger.info(f"[{sub_id}] Median channel std sau lọc & avg ref: {post_filter_std_uv:.2f} µV")
 
-    eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
-    good_for_rank = len(eeg_picks) - 1 - n_interp - len(unrecoverable)  # -1: average reference
+    mne_event_id = {"Frequent": 1, "Target": 2}
+    epoch_cfg = config["EPOCHS"]
 
-    # 6. NHÁNH A: epoch trước ICA, không reject
-    def make_epochs(r):
-        return mne.Epochs(r, events=events, event_id=event_id, tmin=ecfg["tmin"], tmax=ecfg["tmax"],
-                          baseline=ecfg["baseline"], picks=eeg_picks, reject=None, preload=True, verbose=False)
+    # --------------------------------------------------------------------------
+    # 10. NHÁNH ĐỐI CHỨNG (ABLATION STUDY): X_no_ica_no_reject
+    # --------------------------------------------------------------------------
+    epochs_no_ica: Optional[mne.Epochs] = None
+    if config.get("SAVE_ABLATION_STUDY", True):
+        logger.info(f"[{sub_id}] [Ablation] Tạo nhánh đối chứng (X_no_ica_no_reject)...")
+        epochs_no_ica = mne.Epochs(
+            raw,
+            events=events_res,
+            event_id=mne_event_id,
+            tmin=epoch_cfg["tmin"],
+            tmax=epoch_cfg["tmax"],
+            baseline=epoch_cfg["baseline"],
+            reject=None,
+            reject_by_annotation=True,
+            metadata=df_events_meta.copy(),
+            preload=True,
+            verbose=False,
+        )
 
-    epochs_a = make_epochs(raw)
-    p300_a = p300_effect(epochs_a, ica_cfg["p300_channels"], ica_cfg["p300_window"])
-    XA = epochs_a.get_data().astype(np.float32)
-    sel_a = epochs_a.selection.copy()
-    del epochs_a
+    # --------------------------------------------------------------------------
+    # 11. KHỬ NHIỄU MẮT TỰ ĐỘNG BẰNG ICA TRÊN TÍN HIỆU 250 Hz
+    # --------------------------------------------------------------------------
+    ica_cfg = config["ICA"]
+    raw_for_ica = raw.copy().filter(
+        l_freq=ica_cfg["high_pass"],
+        h_freq=None,
+        picks="eeg",
+        verbose=False,
+    )
 
-    # 7. ICA: fit trên epoch 1 s đã loại đoạn nhiễu lớn
-    var_before = float(np.var(raw.get_data(picks=eeg_picks), axis=1).sum())
-    raw_fit = raw.copy().filter(ica_cfg["high_pass"], None, picks="eeg", n_jobs=n_jobs, verbose=False)
-    fit_ep = mne.make_fixed_length_epochs(raw_fit, duration=ica_cfg["fit_epoch_sec"], preload=True,
-                                          reject_by_annotation=False, verbose=False)
-    n_before = len(fit_ep)
-    fit_ep.drop_bad(reject=dict(eeg=ica_cfg["fit_reject_ptp"]), verbose=False)
-    n_fit_epochs = len(fit_ep)
-    if n_fit_epochs < ica_cfg["min_fit_epochs"]:
-        logger.warning(f"[{sub_id}] Chỉ còn {n_fit_epochs}/{n_before} epoch 1 s để fit ICA (ít) -> kết quả ICA kém tin cậy.")
+    data_rank = int(mne.compute_rank(raw_for_ica, rank="info")["eeg"])
+    fit_n_components = min(int(ica_cfg["n_components"]), data_rank)
+    logger.info(f"[{sub_id}] Rank EEG = {data_rank}. Fit ICA (n_components={fit_n_components}) ở {resample_freq} Hz...")
 
-    n_comp = int(min(ica_cfg["n_components"], good_for_rank))
-    method, fit_params = ica_cfg["method"], None
-    if method == "picard":
+    ica = mne.preprocessing.ICA(
+        n_components=fit_n_components,
+        method=ica_cfg["method"],
+        random_state=ica_cfg["random_state"],
+        max_iter="auto",
+        verbose=False,
+    )
+    ica.fit(raw_for_ica, reject_by_annotation=True, verbose=False)
+
+    if hasattr(ica, "pca_explained_variance_") and np.sum(ica.pca_explained_variance_) > 0:
+        exp_var = float(
+            np.sum(ica.pca_explained_variance_[:fit_n_components])
+            / np.sum(ica.pca_explained_variance_)
+            * 100.0
+        )
+    else:
+        exp_var = 0.0
+
+    available_eog = [ch for ch in ica_cfg["eog_channels"] if ch in raw.ch_names]
+    eog_inds: List[int] = []
+    scores = []
+    if available_eog:
         try:
-            import picard  # noqa: F401
-            fit_params = dict(ortho=False, extended=True)
-        except ImportError: 
-            logger.warning(f"[{sub_id}] Chưa cài python-picard -> dùng fastica (pip install python-picard).")
-            method = "fastica"
-    logger.info(f"[{sub_id}] ICA: rank≈{good_for_rank}, n_components={n_comp}, method={method}, fit trên {n_fit_epochs} epoch.")
-    ica = mne.preprocessing.ICA(n_components=n_comp, method=method, fit_params=fit_params,
-                                random_state=ica_cfg["random_state"], max_iter="auto", verbose=False)
-    ica.fit(fit_ep, verbose=False)
-    del raw_fit, fit_ep
-    gc.collect()
+            found_inds, scores = ica.find_bads_eog(
+                raw,
+                ch_name=available_eog,
+                threshold=ica_cfg["threshold"],
+                verbose=False,
+            )
+            eog_inds = sorted(set(int(ic) for ic in found_inds))
+            scores_arr = np.atleast_2d(np.asarray(scores))
+            eog_scores = (
+                [float(np.max(np.abs(scores_arr[:, ic]))) for ic in eog_inds]
+                if len(eog_inds) > 0
+                else []
+            )
+            logger.info(
+                f"[{sub_id}] ICA loại {len(eog_inds)} ICs mắt qua {available_eog}: "
+                f"{eog_inds} (max |z|={[round(s, 2) for s in eog_scores]})"
+            )
+            if len(eog_inds) > int(ica_cfg.get("max_excluded_ics", 4)):
+                logger.warning(
+                    f"[{sub_id}] Số IC nhiễu mắt ({len(eog_inds)}) vượt ngưỡng cảnh báo."
+                )
+        except Exception as eog_err:
+            logger.warning(f"[{sub_id}] Lỗi find_bads_eog: {eog_err}")
 
-    eog_inds, ic_details = select_eog_components(ica, raw, ica_cfg, logger, sub_id)
-    logger.info(f"[{sub_id}] IC bị loại: {eog_inds} "
-                f"(|r|={[round(ic_details[i]['abs_r'], 2) for i in eog_inds]})")
-    if ica_cfg.get("save_diagnostic_plots", True) and ic_details:
+    if save_diag:
         try:
-            save_ica_diag(ic_details, eog_inds, Path(config["FIGURES_DIR"]), sub_id)
-        except Exception as e:  # không để lỗi vẽ hình làm hỏng subject
-            logger.debug(f"Không lưu được hình ICA: {e}")
+            fig_dir = Path(config["FIGURES_DIR"])
+            fig_dir.mkdir(parents=True, exist_ok=True)
+            if len(eog_inds) > 0 and len(scores) > 0:
+                fig = ica.plot_scores(scores, exclude=eog_inds, show=False)
+                fig.savefig(fig_dir / f"{sub_id}_ica_scores.png", dpi=150)
+        except Exception as plot_err:
+            logger.debug(f"[{sub_id}] Không thể lưu hình ICA: {plot_err}")
 
     ica.exclude = eog_inds
     ica.apply(raw, verbose=False)
-    var_after = float(np.var(raw.get_data(picks=eeg_picks), axis=1).sum())
-    removed_var_pct = 100.0 * (1.0 - var_after / max(var_before, 1e-30))
+    raw.reorder_channels(reference_channel_order)
 
-    # 8. NHÁNH B (ICA, no reject) và C (ICA + reject) KHỚP TỪNG TRIAL  (SỬA [7])
-    epochs_b = make_epochs(raw)
-    if not np.array_equal(sel_a, epochs_b.selection):
-        raise RuntimeError(f"[{sub_id}] Nhánh A và B không cùng tập epoch!")
-    p300_b = p300_effect(epochs_b, ica_cfg["p300_channels"], ica_cfg["p300_window"])
-    p300_change = None
-    if p300_a is not None and p300_b is not None and abs(p300_a) > 1e-9:
-        p300_change = 100.0 * (p300_b - p300_a) / abs(p300_a)
-        if abs(p300_change) > ica_cfg["p300_change_warn_pct"]:
-            logger.warning(f"[{sub_id}] CẢNH BÁO: biên độ P300 (Target-Frequent) đổi {p300_change:+.1f}% sau ICA. "
-                           f"Kiểm tra IC bị loại {eog_inds}.")
+    # --------------------------------------------------------------------------
+    # 12. CẮT ĐOẠN SẠCH (EPOCHING) VỚI reject_by_annotation=True
+    # --------------------------------------------------------------------------
+    reject_criteria = dict(eeg=float(epoch_cfg["reject_amp"]))
+    epochs_clean = mne.Epochs(
+        raw,
+        events=events_res,
+        event_id=mne_event_id,
+        tmin=epoch_cfg["tmin"],
+        tmax=epoch_cfg["tmax"],
+        baseline=epoch_cfg["baseline"],
+        reject=reject_criteria,
+        reject_by_annotation=True,
+        metadata=df_events_meta.copy(),
+        preload=True,
+        verbose=False,
+    )
 
-    probe = epochs_b.copy().drop_bad(reject=dict(eeg=ecfg["reject_amp"]), verbose=False)
-    keep = np.isin(epochs_b.selection, probe.selection)
-    del probe
+    if list(epochs_clean.ch_names) != reference_channel_order:
+        raise RuntimeError(f"[{sub_id}] Thứ tự kênh epochs_clean không khớp canonical order!")
 
-    XB = epochs_b.get_data().astype(np.float32)
-    y_all = np.where(epochs_b.events[:, 2] == event_id["Target"],
-                     config["TARGET_LABELS"]["Target"], config["TARGET_LABELS"]["Frequent"]).astype(np.int64)
-    onset = epochs_b.events[:, 0].astype(np.int64)
-    drop_b = parse_drop_log_reasons(epochs_b)
+    drop_stats = parse_drop_log_reasons(epochs_clean, raw)
 
-    # 9. Ghi ra đĩa
-    np.save(files["X_clean"], XB[keep])
-    np.save(files["y_clean"], y_all[keep])
-    if config["SAVE_ABLATION_STUDY"]:
-        np.save(files["X_a"], XA)
-        np.save(files["X_b"], XB)
-        np.save(files["y_all"], y_all)
-        np.save(files["keep"], keep)
-    pd.DataFrame({
-        "subject_id": sub_id, "trial_idx": np.arange(len(y_all)), "onset_sample": onset,
-        "event_type": np.where(y_all == 1, "Target", "Frequent"), "label": y_all,"rt_ms": rt_ms_all[epochs_b.selection],
-         "keep": keep,
-    }).to_csv(files["meta"], index=False)
-    if config["SAVE_SINGLE_SUBJECT_FIF"] and keep.any():
-        epochs_b[keep].save(out_dir / f"{sub_id}_clean-epo.fif", overwrite=True, verbose=False)
+    meta_clean = epochs_clean.metadata.reset_index(drop=True).copy()
+    meta_clean["trial_idx"] = np.arange(len(meta_clean), dtype=np.int64)
+    meta_clean = meta_clean[METADATA_COLUMNS]
 
-    initial = len(events)
-    amp_rej = int((~keep).sum())
+    meta_no_ica: Optional[pd.DataFrame] = None
+    if epochs_no_ica is not None:
+        meta_no_ica = epochs_no_ica.metadata.reset_index(drop=True).copy()
+        meta_no_ica["trial_idx"] = np.arange(len(meta_no_ica), dtype=np.int64)
+        kept_uid_set = set(meta_clean["trial_uid"].astype(str).tolist())
+        meta_no_ica["kept_in_clean"] = meta_no_ica["trial_uid"].astype(str).isin(kept_uid_set)
+        meta_no_ica = meta_no_ica[METADATA_COLUMNS + ["kept_in_clean"]]
+
+    n_frequent = int((meta_clean["label"] == 0).sum())
+    n_target = int((meta_clean["label"] == 1).sum())
+    clean_epoch_std_uv = (
+        float(np.median(np.std(epochs_clean.get_data(), axis=(0, 2))) * 1e6)
+        if len(epochs_clean) > 0
+        else 0.0
+    )
+    drop_rate_pct = (
+        (n_behavior_clean - len(epochs_clean)) / max(n_behavior_clean, 1) * 100.0
+    )
+
+    logger.info(
+        f"[{sub_id}] Hoàn thành: Hành vi={n_behavior_clean} -> Giữ={len(epochs_clean)} "
+        f"(Drop={drop_rate_pct:.2f}% | Amp={drop_stats['amplitude_rejected']}, "
+        f"Annot={drop_stats['annotation_rejected']}, Biên={drop_stats['boundary_or_other']}). "
+        f"Frequent={n_frequent}, Target={n_target}."
+    )
+
     stats = {
         "subject_id": sub_id,
-        "initial_events": initial,
-        "ica_no_reject_kept": len(epochs_b),
-        "clean_kept": int(keep.sum()),
-        "amplitude_rejected": amp_rej,
-        "annotation_rejected": drop_b["annotation_rejected"],
-        "boundary_rejected": initial - len(epochs_b),
-        "reject_rate_pct": 100.0 * (initial - int(keep.sum())) / max(initial, 1),
-        "n_frequent": int(((y_all == 0) & keep).sum()),
-        "n_target": int(((y_all == 1) & keep).sum()),
-        "montage_source": montage_source,
-        "n_no_position": len(no_pos),
-        "bad_channels": ";".join(bad_channels),
-        "n_interpolated": n_interp,
-        "unrecoverable_bads": ";".join(unrecoverable),
-        "line_prominence_db": line_prom,
-        "line_residual_db": line_resid,
-        "notch_applied": bool(use_notch),
-        "data_rank": int(good_for_rank),
-        "ica_method": method,
-        "ica_n_components": n_comp,
-        "ica_n_fit_epochs": n_fit_epochs,
+        "n_interpolated_channels": len(bad_channels),
+        "interpolated_channels": ";".join(bad_channels),
+        "n_ica_excluded": len(eog_inds),
         "ica_excluded_ics": ";".join(map(str, eog_inds)),
-        "ica_removed_var_pct": round(removed_var_pct, 3),
-        "p300_diff_before_uV": None if p300_a is None else round(p300_a * 1e6, 3),
-        "p300_diff_after_uV": None if p300_b is None else round(p300_b * 1e6, 3),
-        "p300_change_pct": None if p300_change is None else round(p300_change, 2),
-        "seconds": round(time.time() - t0, 1),
+        "n_behavior_clean_epochs": n_behavior_clean,
+        "n_clean_epochs_kept": int(len(epochs_clean)),
+        "drop_rate_pct": round(float(drop_rate_pct), 2),
+        "post_filter_std_uv": round(post_filter_std_uv, 2),
+        "clean_epoch_std_uv": round(clean_epoch_std_uv, 2),
+        "n_frequent": n_frequent,
+        "n_target": n_target,
+        "amplitude_rejected": int(drop_stats["amplitude_rejected"]),
+        "annotation_rejected": int(drop_stats["annotation_rejected"]),
+        "boundary_rejected": int(drop_stats["boundary_or_other"]),
+        "data_rank": data_rank,
+        "ica_exp_variance": round(exp_var, 2),
     }
     files["stats"].write_text(json.dumps(_jsonable(stats), indent=2), encoding="utf-8")
     logger.info(f"[{sub_id}] Xong: {initial} -> {stats['clean_kept']} epoch "
@@ -777,197 +1093,346 @@ def process_single_subject(vhdr_path: Path, config: Dict, reference_channel_orde
     gc.collect()
     return stats
 
-
-# ==============================================================================
-# 8. GHÉP KẾT QUẢ BẰNG MEMMAP (SỬA [2])
-# ==============================================================================
-def merge_npy(paths: List[Path], out_path: Path, mask_paths: Optional[List[Path]] = None) -> Tuple[int, ...]:
-    first = np.load(paths[0], mmap_mode="r")
-    counts = []
-    for i, p in enumerate(paths):
-        n = np.load(p, mmap_mode="r").shape[0]
-        counts.append(int(np.load(mask_paths[i]).sum()) if mask_paths else n)
-    out = np.lib.format.open_memmap(out_path, mode="w+", dtype=first.dtype, shape=(sum(counts), *first.shape[1:]))
-    i = 0
-    for k, p in enumerate(paths):
-        a = np.load(p, mmap_mode="r")
-        a = a[np.load(mask_paths[k])] if mask_paths else np.asarray(a)
-        out[i:i + len(a)] = a
-        i += len(a)
-    out.flush()
-    shape = out.shape
-    del out
-    return shape
-
-
-def stage_subject_files(vhdr_path: Path, stage_dir: Path, sub_id: str) -> Path:
-    """Copy file của 1 subject từ Drive về đĩa local (Colab), trả về đường dẫn .vhdr local."""
-    dst = stage_dir / sub_id
-    dst.mkdir(parents=True, exist_ok=True)
-    for f in vhdr_path.parent.iterdir():
-        if not f.is_file():
-            continue
-        same_recording = f.stem == vhdr_path.stem
-        coord = f.name.endswith(("electrodes.tsv", "coordsystem.json")) and sub_id in f.name or f.suffix == ".bvct"
-        if same_recording or coord:
-            shutil.copy2(f, dst / f.name)
-    return dst / vhdr_path.name
+    return epochs_clean, epochs_no_ica, meta_clean, meta_no_ica, stats
 
 
 # ==============================================================================
 # 9. PIPELINE CHÍNH
 # ==============================================================================
-def run_pipeline(config: Dict = CONFIG) -> None:
-    
-    config = resolve_paths(config)
-    raw_dir, processed_dir = Path(config["RAW_DIR"]), Path(config["PROCESSED_DIR"])
+def run_pipeline(
+    config: Dict[str, Any] = CONFIG,
+    subjects: Optional[Sequence[str]] = None,
+    resume: bool = True,
+    include_excluded: bool = False,
+) -> None:
+    """Thực thi pipeline tiền xử lý theo Cohort Policy & hỗ trợ caching theo subject."""
+    raw_dir = Path(config["RAW_DIR"])
+    processed_dir = Path(config["PROCESSED_DIR"])
     processed_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logging(processed_dir / "preprocessing.log")
+    cache_dir = processed_dir / "per_subject"
 
-    status = {"status": "RUNNING", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"), "config": _jsonable(config)}
-    (processed_dir / "pipeline_status.json").write_text(json.dumps(status, indent=4), encoding="utf-8")
+    log_file = processed_dir / "preprocessing.log"
+    logger = setup_logging(log_file)
+
+    status_manifest = {
+        "status": "RUNNING",
+        "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": _to_json_serializable(config),
+    }
+    with open(processed_dir / "pipeline_status.json", "w", encoding="utf-8") as f:
+        json.dump(status_manifest, f, indent=4)
 
     logger.info("=" * 80)
-    logger.info("PIPELINE TIỀN XỬ LÝ EEG P300 (V3)")
-    logger.info(f"Nguồn thô:  {raw_dir.resolve()}")
-    logger.info(f"Đầu ra:     {processed_dir.resolve()}")
+    logger.info("BẮT ĐẦU PIPELINE TIỀN XỬ LÝ EEG SINGLE-TRIAL (V2.5 - DATA CONTRACT)")
+    logger.info(f"Thư mục nguồn thô: {raw_dir.resolve()}")
+    logger.info(f"Thư mục đầu ra sạch: {processed_dir.resolve()}")
     logger.info("=" * 80)
 
-    exclude_set = set(config.get("EXCLUDE_SUBJECTS", []))
-    vhdr_files = [
-        f for f in sorted(raw_dir.rglob("*.vhdr"), key=natural_sort_key)
-        if extract_subject_id(f) not in exclude_set
-    ]
-    total = len(vhdr_files)
-    logger.info(f"Tìm thấy {total} subjects.")
-    if total == 0:
-        status["status"] = "FAILED_NO_FILES"
-        (processed_dir / "pipeline_status.json").write_text(json.dumps(status, indent=4), encoding="utf-8")
+    all_vhdr_files = sorted(list(raw_dir.rglob("*.vhdr")), key=natural_sort_key)
+    if not all_vhdr_files:
+        logger.error(f"Không tìm thấy file .vhdr nào trong '{raw_dir}'. Dừng chương trình.")
+        status_manifest["status"] = "FAILED_NO_FILES"
+        with open(processed_dir / "pipeline_status.json", "w", encoding="utf-8") as f:
+            json.dump(status_manifest, f, indent=4)
         return
 
-    raw_ref = mne.io.read_raw_brainvision(vhdr_files[0], preload=False, verbose=False)
-    setup_channel_montage(raw_ref, vhdr_files[0], config["CHANNEL_ALIASES"], logger, config["MONTAGE"])
-    reference_channel_order = list(raw_ref.ch_names)
-    del raw_ref
-    logger.info(f"Thứ tự kênh chuẩn ({len(reference_channel_order)} kênh): {reference_channel_order[:10]}...")
+    excluded_set = set() if include_excluded else set(config.get("EXCLUDE_SUBJECTS", EXCLUDE_SUBJECTS))
+    requested_set = set(subjects) if subjects else None
 
-    sub_dir = processed_dir / "subjects"
-    sub_dir.mkdir(exist_ok=True)
-    stage_dir = Path(config["STAGE_LOCAL_DIR"]) if config.get("STAGE_LOCAL_DIR") else None
-
-    stats_list: List[Dict] = []
-    failed: List[Dict] = []
-    t_start = time.time()
-
-    for vhdr in tqdm(vhdr_files, desc="Subjects", unit="sub", file=sys.stdout):
-        sub_id = extract_subject_id(vhdr)
-        files = _subject_files(sub_dir, sub_id)
-        need = [files["X_clean"], files["y_clean"], files["meta"], files["stats"]]
-        if config["SAVE_ABLATION_STUDY"]:
-            need += [files["X_a"], files["X_b"], files["y_all"], files["keep"]]
-        if config.get("RESUME", True) and all(p.exists() for p in need):
-            logger.info(f"[{sub_id}] Đã có kết quả -> bỏ qua (RESUME).")
-            stats_list.append(json.loads(files["stats"].read_text(encoding="utf-8")))
+    vhdr_files: List[Path] = []
+    for p in all_vhdr_files:
+        sid = extract_subject_id(p)
+        if sid in excluded_set:
+            logger.info(f"Bỏ qua subject bị loại theo Cohort Policy: {sid}")
             continue
-        staged = None
+        if requested_set is not None and sid not in requested_set:
+            continue
+        vhdr_files.append(p)
+
+    if requested_set is not None:
+        found_ids = {extract_subject_id(p) for p in vhdr_files}
+        missing_req = sorted(requested_set - found_ids, key=natural_sort_key)
+        if missing_req:
+            logger.warning(f"Các subject yêu cầu không khả dụng hoặc bị loại: {missing_req}")
+
+    total_subjects = len(vhdr_files)
+    logger.info(f"Tổng số subjects sẽ xử lý: {total_subjects} (exclude={sorted(excluded_set)})")
+    if total_subjects == 0:
+        logger.error("Không còn subject nào để xử lý!")
+        status_manifest["status"] = "FAILED_NO_SUBJECTS"
+        with open(processed_dir / "pipeline_status.json", "w", encoding="utf-8") as f:
+            json.dump(status_manifest, f, indent=4)
+        return
+
+    # Khóa thứ tự 127 kênh chuẩn theo sub-01 sau khi chuẩn hóa 4 aliases
+    reference_channel_order = get_canonical_127_channels(
+        raw_dir, channel_aliases=config["CHANNEL_ALIASES"], logger=logger
+    )
+    logger.info(
+        f"Thứ tự 127 kênh chuẩn ({len(reference_channel_order)} kênh): "
+        f"{reference_channel_order[:8]} ... {reference_channel_order[-4:]}"
+    )
+
+    tmin = float(config["EPOCHS"]["tmin"])
+    tmax = float(config["EPOCHS"]["tmax"])
+    expected_n_times = int(np.round((tmax - tmin) * float(config["RESAMPLE_FREQ"]))) + 1
+
+    clean_data_list: List[np.ndarray] = []
+    clean_labels_list: List[np.ndarray] = []
+    clean_sub_ids_list: List[np.ndarray] = []
+    clean_meta_dfs: List[pd.DataFrame] = []
+
+    no_ica_data_list: List[np.ndarray] = []
+    no_ica_labels_list: List[np.ndarray] = []
+    no_ica_sub_ids_list: List[np.ndarray] = []
+    no_ica_meta_dfs: List[pd.DataFrame] = []
+
+    subject_stats: List[Dict[str, Any]] = []
+    failed_subjects: List[Dict[str, str]] = []
+
+    start_time = time.time()
+    num_diag = int(config["ICA"].get("num_diag_subjects", 3))
+
+    for idx, vhdr_path in enumerate(
+        tqdm(vhdr_files, desc="Đang xử lý subjects", unit="sub", file=sys.stdout), start=1
+    ):
+        sub_id = extract_subject_id(vhdr_path)
+        cache_path = cache_dir / f"{sub_id}_cache.npz"
+        save_diag = bool(config["ICA"].get("save_diagnostic_plots", True)) and (idx <= num_diag)
+
         try:
-            path = vhdr
-            if stage_dir is not None:
-                path = staged = stage_subject_files(vhdr, stage_dir, sub_id)
-            stats_list.append(process_single_subject(path, config, reference_channel_order, logger, processed_dir))
+            cached = (
+                _load_subject_cache(cache_path, reference_channel_order, expected_n_times)
+                if resume
+                else None
+            )
+
+            if cached is not None:
+                logger.info(f"[{sub_id}] Nạp từ cache: {cache_path.name}")
+                data_clean = cached["X_clean"]
+                labels_clean = cached["y_clean"]
+                meta_clean = cached["meta_clean"]
+                data_no_ica = cached["X_no_ica"]
+                labels_no_ica = cached["y_no_ica"]
+                meta_no_ica = cached["meta_no_ica"]
+                stats = cached["stats"]
+            else:
+                epochs_clean, epochs_no_ica, meta_clean, meta_no_ica, stats = (
+                    process_single_subject(
+                        vhdr_path=vhdr_path,
+                        config=config,
+                        reference_channel_order=reference_channel_order,
+                        logger=logger,
+                        save_diag=save_diag,
+                    )
+                )
+
+                if config.get("SAVE_SINGLE_SUBJECT_FIF", True):
+                    fif_path = processed_dir / f"{sub_id}_clean-epo.fif"
+                    epochs_clean.save(fif_path, overwrite=True, verbose=False)
+
+                data_clean = epochs_clean.get_data().astype(np.float32)
+                labels_clean = meta_clean["label"].to_numpy(dtype=np.int64)
+
+                if config.get("SAVE_ABLATION_STUDY", True) and epochs_no_ica is not None and meta_no_ica is not None:
+                    data_no_ica = epochs_no_ica.get_data().astype(np.float32)
+                    labels_no_ica = meta_no_ica["label"].to_numpy(dtype=np.int64)
+                else:
+                    data_no_ica = np.empty((0, len(reference_channel_order), expected_n_times), dtype=np.float32)
+                    labels_no_ica = np.empty((0,), dtype=np.int64)
+                    meta_no_ica = pd.DataFrame(columns=METADATA_COLUMNS + ["kept_in_clean"])
+
+                _save_subject_cache(
+                    cache_path=cache_path,
+                    X_clean=data_clean,
+                    y_clean=labels_clean,
+                    X_no_ica=data_no_ica,
+                    y_no_ica=labels_no_ica,
+                    meta_clean=meta_clean,
+                    meta_no_ica=meta_no_ica,
+                    stats=stats,
+                    channel_names=reference_channel_order,
+                )
+
+            clean_data_list.append(data_clean)
+            clean_labels_list.append(labels_clean)
+            clean_sub_ids_list.append(np.array([sub_id] * len(labels_clean), dtype="<U10"))
+            clean_meta_dfs.append(meta_clean)
+
+            if config.get("SAVE_ABLATION_STUDY", True) and len(labels_no_ica) > 0:
+                no_ica_data_list.append(data_no_ica)
+                no_ica_labels_list.append(labels_no_ica)
+                no_ica_sub_ids_list.append(np.array([sub_id] * len(labels_no_ica), dtype="<U10"))
+                no_ica_meta_dfs.append(meta_no_ica)
+
+            subject_stats.append(stats)
+
         except Exception as err:
             logger.error(f"[!] LỖI TẠI {sub_id}: {err}")
             logger.error(traceback.format_exc())
-            failed.append({"subject_id": sub_id, "error": str(err)})
-        finally:
-            if staged is not None:
-                shutil.rmtree(staged.parent, ignore_errors=True)
-            gc.collect()
+            failed_subjects.append({"subject_id": sub_id, "error": str(err)})
+            continue
 
-    duration = time.time() - t_start
+    total_duration = time.time() - start_time
 
-    # ---- Ghép đầu ra (memmap, không tốn RAM) ----
-    ok_ids = [s["subject_id"] for s in stats_list]
-    F = {sid: _subject_files(sub_dir, sid) for sid in ok_ids}
-    logger.info("=" * 80 + "\nĐANG GHÉP DỮ LIỆU ĐẦU RA (memmap)...")
-    if ok_ids:
-        shape = merge_npy([F[s]["X_clean"] for s in ok_ids], processed_dir / "X_clean.npy")
-        y_shape = merge_npy([F[s]["y_clean"] for s in ok_ids], processed_dir / "y.npy")
-        ids_arr = np.concatenate([np.array([s] * int(np.load(F[s]["y_clean"], mmap_mode="r").shape[0]), dtype="U10") for s in ok_ids])
-        np.save(processed_dir / "subject_ids.npy", ids_arr)
-        logger.info(f"✅ X_clean.npy {shape} | y.npy {y_shape} | subject_ids.npy {ids_arr.shape}")
+    # ==============================================================================
+    # 6. XUẤT CÁC TẬP DỮ LIỆU NUMPY (.NPY) VÀ METADATA CHUẨN
+    # ==============================================================================
+    logger.info("\n" + "=" * 80)
+    logger.info("ĐANG XUẤT CÁC TẬP FILE ĐẦU RA THEO DATA CONTRACT...")
+    logger.info("=" * 80)
 
-        if config["SAVE_ABLATION_STUDY"]:
-            sa = merge_npy([F[s]["X_a"] for s in ok_ids], processed_dir / "X_no_ica_no_reject.npy")
-            sb = merge_npy([F[s]["X_b"] for s in ok_ids], processed_dir / "X_ica_no_reject.npy")
-            merge_npy([F[s]["y_all"] for s in ok_ids], processed_dir / "y_all.npy")
-            merge_npy([F[s]["keep"] for s in ok_ids], processed_dir / "keep_mask.npy")
-            ids_all = np.concatenate([np.array([s] * int(np.load(F[s]["y_all"], mmap_mode="r").shape[0]), dtype="U10") for s in ok_ids])
-            np.save(processed_dir / "subject_ids_all.npy", ids_all)
-            logger.info(f"✅ [Ablation] A={sa} | B={sb} | keep_mask/y_all/subject_ids_all cùng độ dài. "
-                        f"C = B[keep_mask] = X_clean.")
+    if clean_data_list:
+        X_clean = np.concatenate(clean_data_list, axis=0).astype(np.float32)
+        y_clean = np.concatenate(clean_labels_list, axis=0).astype(np.int64)
+        subject_ids_clean = np.concatenate(clean_sub_ids_list, axis=0).astype("<U10")
+        df_meta = pd.concat(clean_meta_dfs, ignore_index=True)[METADATA_COLUMNS]
 
-        meta = pd.concat([pd.read_csv(F[s]["meta"]) for s in ok_ids], ignore_index=True)
-        meta.to_csv(processed_dir / "metadata_all.csv", index=False)
-        meta[meta["keep"]].drop(columns="keep").reset_index(drop=True).to_csv(processed_dir / "metadata.csv", index=False)
-        pd.DataFrame(stats_list).to_csv(processed_dir / "subject_summary.csv", index=False)
+        np.save(processed_dir / "X_clean.npy", X_clean)
+        np.save(processed_dir / "y.npy", y_clean)
+        np.save(processed_dir / "subject_ids.npy", subject_ids_clean)
+        df_meta.to_csv(processed_dir / "metadata.csv", index=False)
 
-    tmin, tmax = config["EPOCHS"]["tmin"], config["EPOCHS"]["tmax"]
-    n_t = int(np.round((tmax - tmin) * config["RESAMPLE_FREQ"])) + 1
-    np.save(processed_dir / "times.npy", np.linspace(tmin, tmax, n_t))
-    (processed_dir / "channel_names.json").write_text(json.dumps(reference_channel_order, indent=4), encoding="utf-8")
-    (processed_dir / "preprocessing_config.json").write_text(json.dumps(_jsonable(config), indent=4), encoding="utf-8")
-    if failed:
-        pd.DataFrame(failed).to_csv(processed_dir / "failed_subjects.csv", index=False)
-        logger.warning(f"⚠️ {len(failed)} subjects lỗi (failed_subjects.csv). Chạy lại để RESUME các subject còn thiếu.")
+        logger.info(f"Đã lưu X_clean.npy: shape={X_clean.shape}, dtype={X_clean.dtype}")
+        logger.info(f"Đã lưu y.npy: shape={y_clean.shape}, dtype={y_clean.dtype}")
+        logger.info(f"Đã lưu subject_ids.npy: shape={subject_ids_clean.shape}, dtype={subject_ids_clean.dtype}")
+        logger.info(f"Đã lưu metadata.csv: {len(df_meta)} hàng")
 
-    # ---- Tổng kết ----
-    df = pd.DataFrame(stats_list)
-    if len(df):
-        ini, clean = int(df["initial_events"].sum()), int(df["clean_kept"].sum())
-        nf, nt = int(df["n_frequent"].sum()), int(df["n_target"].sum())
-        flagged = df[df["p300_change_pct"].abs() > config["ICA"]["p300_change_warn_pct"]]["subject_id"].tolist() \
-            if "p300_change_pct" in df else []
-        logger.info(f"""
-================================================================================
-BÁO CÁO TỔNG KẾT
-================================================================================
- • Thời gian (lần chạy này):  {duration / 60:.1f} phút
- • Subjects thành công/lỗi:   {len(df)} / {len(failed)} (tổng {total})
- • Initial events:            {ini:,}
- • Epoch giữ lại (clean):     {clean:,}
- • Loại do biên độ:           {int(df['amplitude_rejected'].sum()):,}
- • Loại do biên/thiếu dữ liệu:{int(df['boundary_rejected'].sum()):,}
- • Lớp 0 Frequent / lớp 1 Target: {nf:,} / {nt:,} (~1 Target : {nf / max(nt, 1):.1f} Frequent)
- • Montage đo thực tế:        {int(df['montage_source'].astype(str).str.startswith('measured').sum())}/{len(df)} subjects
- • Notch được áp dụng:        {int(df['notch_applied'].sum())}/{len(df)} subjects
- • Subject P300 đổi > {config['ICA']['p300_change_warn_pct']:.0f}% sau ICA: {flagged}
-LƯU Ý: dùng GroupKFold / LOSO theo subject_ids.npy, KHÔNG train_test_split ngẫu nhiên.
-================================================================================""")
+    if config.get("SAVE_ABLATION_STUDY", True) and no_ica_data_list:
+        X_no_ica = np.concatenate(no_ica_data_list, axis=0).astype(np.float32)
+        y_no_ica = np.concatenate(no_ica_labels_list, axis=0).astype(np.int64)
+        subject_ids_no_ica = np.concatenate(no_ica_sub_ids_list, axis=0).astype("<U10")
+        df_meta_no_ica = pd.concat(no_ica_meta_dfs, ignore_index=True)[
+            METADATA_COLUMNS + ["kept_in_clean"]
+        ]
 
-    if not failed and len(df) == total:
-        status["status"] = "COMPLETED"
-    elif len(df) > 0:
-        status["status"] = "COMPLETED_WITH_ERRORS"
+        np.save(processed_dir / "X_no_ica_no_reject.npy", X_no_ica)
+        np.save(processed_dir / "y_no_ica_no_reject.npy", y_no_ica)
+        np.save(processed_dir / "subject_ids_no_ica_no_reject.npy", subject_ids_no_ica)
+        df_meta_no_ica.to_csv(processed_dir / "metadata_no_ica.csv", index=False)
+
+        logger.info(f"[Ablation] Đã lưu X_no_ica_no_reject.npy: shape={X_no_ica.shape}")
+        logger.info(f"[Ablation] Đã lưu metadata_no_ica.csv: {len(df_meta_no_ica)} hàng")
+
+    times = np.linspace(tmin, tmax, expected_n_times, dtype=np.float64)
+    np.save(processed_dir / "times.npy", times)
+    logger.info(f"Đã lưu times.npy: shape={times.shape}, dtype={times.dtype}")
+
+    with open(processed_dir / "channel_names.json", "w", encoding="utf-8") as f:
+        json.dump(reference_channel_order, f, indent=4)
+    logger.info(f"Đã lưu channel_names.json ({len(reference_channel_order)} kênh)")
+
+    with open(processed_dir / "preprocessing_config.json", "w", encoding="utf-8") as f:
+        json.dump(_to_json_serializable(config), f, indent=4)
+
+    if subject_stats:
+        df_summary = pd.DataFrame(subject_stats)
+        df_summary.to_csv(processed_dir / "preprocessing_qc_summary.csv", index=False)
+        df_summary.to_csv(processed_dir / "subject_summary.csv", index=False)
+        logger.info(f"Đã lưu preprocessing_qc_summary.csv ({len(df_summary)} subjects)")
+
+    if failed_subjects:
+        df_failed = pd.DataFrame(failed_subjects)
+        df_failed.to_csv(processed_dir / "failed_subjects.csv", index=False)
+        logger.warning(f"Có {len(failed_subjects)} subjects lỗi -> failed_subjects.csv")
+
+    total_successful = len(subject_stats)
+    total_behavior = sum(s["n_behavior_clean_epochs"] for s in subject_stats)
+    total_clean = sum(s["n_clean_epochs_kept"] for s in subject_stats)
+    total_frequent = sum(s["n_frequent"] for s in subject_stats)
+    total_target = sum(s["n_target"] for s in subject_stats)
+
+    logger.info(
+        f"Hoàn tất {total_successful}/{total_subjects} subjects trong {total_duration:.2f}s "
+        f"({total_duration / 60:.2f} phút). Clean epochs={total_clean}/{total_behavior} "
+        f"(Frequent={total_frequent}, Target={total_target})."
+    )
+
+    if len(failed_subjects) == 0 and total_successful == total_subjects:
+        status_manifest["status"] = "COMPLETED"
+    elif total_successful > 0:
+        status_manifest["status"] = "COMPLETED_WITH_ERRORS"
     else:
-        status["status"] = "FAILED"
-    status.update(end_time=time.strftime("%Y-%m-%d %H:%M:%S"), successful_subjects=len(df), failed_subjects=len(failed))
-    (processed_dir / "pipeline_status.json").write_text(json.dumps(status, indent=4), encoding="utf-8")
+        status_manifest["status"] = "FAILED"
+    status_manifest["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    status_manifest["duration_sec"] = round(total_duration, 2)
+    status_manifest["successful_subjects"] = total_successful
+    status_manifest["failed_subjects"] = len(failed_subjects)
+    with open(processed_dir / "pipeline_status.json", "w", encoding="utf-8") as f:
+        json.dump(status_manifest, f, indent=4)
 
 
-def main(argv: Optional[List[str]] = None) -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--raw-dir"); p.add_argument("--out-dir"); p.add_argument("--figures-dir")
-    p.add_argument("--stage-local-dir", help="Colab: thư mục tạm trên đĩa local, vd /content/tmp_raw")
-    p.add_argument("--no-resume", action="store_true")
-    args, _ = p.parse_known_args(argv)  # parse_known_args: bỏ qua tham số '-f' của Jupyter
+# ==============================================================================
+# 6. CLI ENTRYPOINT
+# ==============================================================================
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Pipeline tiền xử lý dữ liệu EEG Oddball P300 theo Data Contract"
+    )
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        default=None,
+        help="Danh sách subject cần xử lý (vd: --subjects sub-03 sub-05). Mặc định chạy toàn bộ 39 subjects sạch.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Chạy toàn bộ cohort 39 subjects sạch (mặc định nếu không truyền --subjects).",
+    )
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=None,
+        help="Thư mục dữ liệu thô BIDS (mặc định: data/raw/oddball_data).",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Thư mục lưu đầu ra (mặc định: data/processed).",
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tái sử dụng cache {out_dir}/per_subject/{sub_id}_cache.npz (mặc định: bật).",
+    )
+    parser.add_argument(
+        "--no-save-fif",
+        action="store_true",
+        help="Không xuất file lẻ *_clean-epo.fif để tiết kiệm dung lượng đĩa.",
+    )
+    parser.add_argument(
+        "--include-excluded",
+        action="store_true",
+        help="Không tự động loại EXCLUDE_SUBJECTS (chỉ dùng để debug).",
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    project_root = Path(__file__).resolve().parents[2]
     cfg = dict(CONFIG)
-    if args.raw_dir: cfg["RAW_DIR"] = args.raw_dir
-    if args.out_dir: cfg["PROCESSED_DIR"] = args.out_dir
-    if args.figures_dir: cfg["FIGURES_DIR"] = args.figures_dir
-    if args.stage_local_dir: cfg["STAGE_LOCAL_DIR"] = args.stage_local_dir
-    if args.no_resume: cfg["RESUME"] = False
-    run_pipeline(cfg)
+    cfg["RAW_DIR"] = args.raw_dir if args.raw_dir is not None else (project_root / "data" / "raw" / "oddball_data")
+    cfg["PROCESSED_DIR"] = args.out_dir if args.out_dir is not None else (project_root / "data" / "processed")
+    cfg["FIGURES_DIR"] = project_root / "results" / "figures" / "ica"
+    if args.no_save_fif:
+        cfg["SAVE_SINGLE_SUBJECT_FIF"] = False
+
+    selected_subjects = None if args.all else args.subjects
+    run_pipeline(
+        config=cfg,
+        subjects=selected_subjects,
+        resume=bool(args.resume),
+        include_excluded=bool(args.include_excluded),
+    )
 
 
 if __name__ == "__main__":

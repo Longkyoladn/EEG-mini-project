@@ -3,10 +3,14 @@
 /oddball_data/
 
 # Standard layout: keep folders via .gitkeep, ignore contents (keep scripts)
+data/raw/*
+!data/raw/oddball_data/
 data/raw/oddball_data/*
 !data/raw/oddball_data/.gitkeep
 data/processed/*
+data/processed/*.npy
 !data/processed/.gitkeep
+data/processed_pilot/
 
 # EEG / data file formats & partial downloads
 *.eeg
@@ -22,11 +26,28 @@ data/processed/*
 *.part
 *.eeg.*
 
-# ── Results (keep .gitkeep only) ───────────────────
+# ── Results (keep .gitkeep & lightweight handover/paper artifacts) ──
 results/*
 !results/*/
 results/*/*
 !results/*/.gitkeep
+results/checkpoints/*
+!results/checkpoints/.gitkeep
+
+# Allow lightweight handover & paper figures (< 2 MB each), block heavy caches
+!results/handover_standard/
+!results/handover_standard/*.csv
+!results/handover_standard/*.npz
+!results/figures/paper/
+!results/figures/paper/*.png
+!results/figures/paper/*.pdf
+!results/metrics/dl2/
+results/metrics/dl2/*
+!results/metrics/dl2/*.json
+!results/metrics/dl2/handover_per_subject_summary_dl2.csv
+results/metrics/dl2/predictions_*.csv
+results/metrics/dl2/handover_predictions_*.csv
+results/metrics/dl2/xai_loso_cache.npz
 
 # ── Model weights / checkpoints ────────────────
 *.pt
@@ -34,11 +55,15 @@ results/*/*
 *.pkl
 *.ckpt
 
-# ── Logs ───────────────────────────────────────
+# ── Logs & temp files ──────────────────────────
 *.log
+*.tmp
+*.bak
 
 # ── Python & environments ──────────────────────
 __pycache__/
+.pytest_cache/
+*.pyc
 *.py[cod]
 .venv/
 venv/
