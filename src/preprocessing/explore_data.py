@@ -59,6 +59,107 @@ def normalize_event_name(name: str) -> str:
     return re.sub(r"\s+", "", name).lower()
 
 
+def default_project_root() -> Path:
+    """SỬA: không phụ thuộc cứng vào __file__ (notebook/Colab không có __file__)."""
+    env = os.getenv("EEG_ROOT")
+    if env:
+        return Path(env)
+    try:
+        return Path(__file__).resolve().parents[2]
+    except (NameError, IndexError):
+        return Path.cwd()
+
+
+def line_noise_report(
+    raw: mne.io.Raw,
+    line_freq: float = 50.0,
+    l_freq: float = 0.5,
+    h_freq: float = 40.0,
+    resample_freq: float = 250.0,
+    residual_db: float = 3.0,
+) -> Dict[str, Any]:
+    """SỬA: thay nhận xét "cứng" bằng phép đo. Độ nổi của đỉnh lưới trên dữ liệu thô, trừ đi độ suy giảm
+    của bộ bandpass sẽ dùng trong pipeline => còn nổi bao nhiêu dB sau lọc? Quyết định notch dựa trên số này."""
+    sfreq = raw.info["sfreq"]
+    tmax = min(120.0, raw.times[-1])
+    n_fft = int(min(sfreq * 4, tmax * sfreq))
+    psd = raw.compute_psd(method="welch", fmin=line_freq - 8, fmax=line_freq + 8, tmax=tmax,
+                          picks="eeg", n_fft=n_fft, verbose=False)
+    data, freqs = psd.get_data(return_freqs=True)
+    db = (10 * np.log10(np.maximum(data, 1e-30))).mean(axis=0)
+    d = np.abs(freqs - line_freq)
+    prominence = float(db[d <= 0.5].max() - np.median(db[(d >= 2.0) & (d <= 6.0)]))
+    from scipy.signal import freqz
+    h = mne.filter.create_filter(None, resample_freq, l_freq, h_freq, method="fir", phase="zero",
+                                 fir_design="firwin", verbose=False)
+    _, resp = freqz(h, worN=[2 * np.pi * line_freq / resample_freq])
+    atten = float(20 * np.log10(max(abs(resp[0]), 1e-12)))
+    residual = prominence + atten
+    return {
+        "prominence_db": prominence,
+        "bandpass_attenuation_db": atten,
+        "residual_db": residual,
+        "notch_needed": residual > residual_db,
+    }
+
+
+def check_montage_files(vhdr_files: List[Path], output_dir: Optional[Path] = None) -> pd.DataFrame:
+    """MỚI: kiểm tra từng subject có file tọa độ điện cực thực tế không, và dữ liệu có hợp lý không
+    (đơn vị, bán kính trung vị trên da đầu). Kết quả quyết định pipeline dùng tọa độ đo hay montage mẫu."""
+    print(f"\n{'='*75}\n02b. KIỂM TRA FILE TỌA ĐỘ ĐIỆN CỰC THỰC TẾ\n{'='*75}")
+    first_dir = vhdr_files[0].parent
+    print(f" • Nội dung thư mục subject đầu tiên ({first_dir}):")
+    for f in sorted(first_dir.iterdir()):
+        print(f"     - {f.name}")
+    rows = []
+    for vhdr in vhdr_files:
+        sub = extract_subject_id(vhdr)
+        d = vhdr.parent
+        tsvs = sorted(d.glob(f"*{sub}*electrodes.tsv")) or sorted(d.glob("*electrodes.tsv"))
+        cs = sorted(d.glob(f"*{sub}*coordsystem.json")) or sorted(d.glob("*coordsystem.json"))
+        bvct = sorted(d.glob("*.bvct"))
+        row = {"subject_id": sub, "electrodes_tsv": bool(tsvs), "coordsystem_json": bool(cs),
+               "bvct": bool(bvct), "n_electrodes": None, "unit": None, "median_radius_m": None, "plausible": None}
+        if tsvs:
+            try:
+                df = pd.read_csv(tsvs[0], sep="\t")
+                xyz = df[["x", "y", "z"]].apply(pd.to_numeric, errors="coerce").dropna().to_numpy(float)
+                unit = "m"
+                if cs:
+                    meta = json.loads(cs[0].read_text(encoding="utf-8"))
+                    unit = str(meta.get("EEGCoordinateUnits", "m")).lower()
+                scale = {"m": 1.0, "cm": 1e-2, "mm": 1e-3}.get(unit, 1.0)
+                r = float(np.median(np.linalg.norm(xyz * scale, axis=1)))
+                row.update(n_electrodes=len(xyz), unit=unit, median_radius_m=round(r, 4), plausible=0.05 <= r <= 0.15)
+            except Exception as e:  # noqa: BLE001
+                row["unit"] = f"LỖI: {e}"
+        rows.append(row)
+    df_m = pd.DataFrame(rows)
+    n_ok = int(df_m["plausible"].fillna(False).sum())
+    print(f" • Subject có electrodes.tsv hợp lý: {n_ok}/{len(df_m)} | có .bvct: {int(df_m['bvct'].sum())}/{len(df_m)}")
+    if n_ok == 0 and int(df_m["bvct"].sum()) == 0:
+        print(" => KHÔNG có tọa độ thực tế dùng được; pipeline sẽ dùng montage mẫu 10-05 (cần ghi rõ trong báo cáo).")
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        df_m.to_csv(output_dir / "montage_files_report.csv", index=False)
+    return df_m
+
+
+def estimate_memory(df: pd.DataFrame, resample_freq: float = 250.0, tmin: float = -0.2, tmax: float = 0.8) -> None:
+    """MỚI: ước lượng RAM để biết có cần ghi từng subject ra đĩa (pipeline V3 luôn làm vậy)."""
+    n_ch = int(df["n_channels"].iloc[0])
+    n_ep = int((df["n_frequent"] + df["n_target"]).sum())
+    n_t = int(round((tmax - tmin) * resample_freq)) + 1
+    per_set = n_ep * n_ch * n_t * 4 / 1e9
+    sfreq = float(df["sampling_rate"].iloc[0])
+    raw_gb = float(df["duration_min"].max()) * 60 * sfreq * n_ch * 8 / 1e9
+    print(f"\n BỘ NHỚ (ước lượng): {n_ep:,} epoch x {n_ch} kênh x {n_t} mẫu (float32)")
+    print(f" • Mỗi bộ epoch toàn dataset:                 {per_set:.2f} GB")
+    print(f" • Cách cũ (2 bộ + np.concatenate, đỉnh):     ~{4 * per_set:.1f} GB (Colab thường 12-13 GB)")
+    print(f" • 1 recording dài nhất @ {sfreq:g} Hz float64:   {raw_gb:.2f} GB (pipeline giữ ~2-3 bản mỗi subject)")
+    print(f" • Cách mới (từng subject + memmap):          đỉnh ~{3 * raw_gb:.1f} GB bất kể số subject")
+
+
 def scan_raw_files(raw_dir: str | Path) -> List[Path]:
     """Quét thư mục và trả về danh sách file .vhdr đã sắp xếp tự nhiên."""
     raw_path = Path(raw_dir)
@@ -347,7 +448,7 @@ def visualize_signals_and_psd(
     if selected_channels:
         sfreq = int(raw.info["sfreq"])
         duration_to_plot = 6.0  # Vẽ 6 giây đầu tiên sau 10s khởi động
-        start_sec = 15.0
+        start_sec = min(15.0, max(0.0, raw.times[-1] - duration_to_plot - 1.0))
         start_sample = int(start_sec * sfreq)
         n_samples = int(duration_to_plot * sfreq)
 
@@ -404,7 +505,12 @@ def visualize_signals_and_psd(
     plt.savefig(psd_path, dpi=200)
     plt.close()
     print(f" Đã lưu biểu đồ phổ PSD: {psd_path.name}")
-    print("   Nhận xét phổ: Đỉnh công suất vọt lên tại 50 Hz khẳng định sự cần thiết của bộ lọc Notch 50 Hz.")
+    rep = line_noise_report(raw)
+    print(f" • Đỉnh 50 Hz nổi {rep['prominence_db']:.1f} dB trên phổ lân cận (dữ liệu thô).")
+    print(f" • Bandpass 0.5-40 Hz của pipeline suy giảm {rep['bandpass_attenuation_db']:.1f} dB tại 50 Hz "
+          f"=> còn nổi {rep['residual_db']:.1f} dB sau lọc.")
+    print("   KẾT LUẬN: " + ("CẦN thêm notch 50 Hz cho subject này." if rep["notch_needed"]
+                           else "KHÔNG cần notch riêng (bandpass đã đủ)."))
 
 
 # ==============================================================================
@@ -502,6 +608,9 @@ def analyze_inter_subject_statistics(
     plt.close()
     print(f" Đã lưu biểu đồ so sánh liên đối tượng: {chart_path.name}")
 
+    if len(df_summary):
+        estimate_memory(df_summary)
+
     return df_summary
 
 
@@ -514,7 +623,7 @@ def run_exploration_suite(
     num_detailed_subjects: int = 2,
 ) -> None:
     """Thực thi đầy đủ 6 bước khám phá dữ liệu chuẩn mực."""
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = default_project_root()
     if raw_data_dir is None:
         raw_data_dir = project_root / "data" / "raw" / "oddball_data"
     else:
@@ -540,6 +649,7 @@ def run_exploration_suite(
 
     # 2. Kiểm tra tính đồng nhất của hệ thống kênh trên toàn bộ 41 subjects
     check_channel_consistency(vhdr_files)
+    check_montage_files(vhdr_files, output_dir)
 
     # 3. Phân tích chi tiết và trực quan hóa cho các subject đại diện
     for vhdr in vhdr_files[:num_detailed_subjects]:
@@ -569,13 +679,16 @@ def run_exploration_suite(
 
 
 if __name__ == "__main__":
-    project_root = Path(__file__).resolve().parents[2]
-    raw_dir = project_root / "data" / "raw" / "oddball_data"
-    figures_dir = project_root / "results" / "figures" / "exploration"
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--raw-dir", default=None)
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--n-detailed", type=int, default=2)
+    args, _ = ap.parse_known_args()  # bỏ qua tham số '-f' của Jupyter/Colab
 
     run_exploration_suite(
-        raw_data_dir=raw_dir,
-        output_figures_dir=figures_dir,
-        num_detailed_subjects=2,
+        raw_data_dir=Path(args.raw_dir).resolve() if args.raw_dir else None,   # tương đối theo thư mục hiện tại
+        output_figures_dir=Path(args.out_dir).resolve() if args.out_dir else None,
+        num_detailed_subjects=args.n_detailed,
     )
-
