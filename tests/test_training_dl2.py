@@ -32,13 +32,10 @@ def _resolve_data_dir() -> Path:
     env_dir = os.environ.get("EEG_DATA_DIR")
     if env_dir:
         return Path(env_dir)
-    default_prod = Path("data/processed")
-    if (default_prod / "X_clean.npy").exists():
-        return default_prod
-    return Path("data/processed_pilot")
+    return Path("data/processed")
 
 
-PILOT_DATA_DIR = _resolve_data_dir()
+PROCESSED_DATA_DIR = _resolve_data_dir()
 
 
 def test_zero_leakage_scaler_and_volts_precision(tmp_path: Path) -> None:
@@ -166,14 +163,14 @@ def test_threshold_tuning_and_metrics() -> None:
 
 def test_dataset_loader_sha256_and_no_ica(tmp_path: Path) -> None:
     """Kiểm tra load_eeg_dataset với clean (khóa SHA-256) và no_ica (đồng bộ 5-fold)."""
-    if not (PILOT_DATA_DIR / "X_clean.npy").exists():
-        pytest.skip("Không có data/processed_pilot để kiểm tra loader.")
+    if not (PROCESSED_DATA_DIR / "X_clean.npy").exists():
+        pytest.skip("Không có data/processed để kiểm tra loader.")
 
-    clean_bundle = load_eeg_dataset(PILOT_DATA_DIR, data_variant="clean")
+    clean_bundle = load_eeg_dataset(PROCESSED_DATA_DIR, data_variant="clean")
     assert clean_bundle.X.shape[1:] == (127, 251)
     assert clean_bundle.X.dtype == np.float32
 
-    no_ica_bundle = load_eeg_dataset(PILOT_DATA_DIR, data_variant="no_ica")
+    no_ica_bundle = load_eeg_dataset(PROCESSED_DATA_DIR, data_variant="no_ica")
     assert no_ica_bundle.X.shape[1:] == (127, 251)
     assert no_ica_bundle.X.shape[0] >= clean_bundle.X.shape[0]
     assert len(no_ica_bundle.splits["cross_subject_5fold"]) == len(
@@ -196,7 +193,7 @@ def test_dataset_loader_sha256_and_no_ica(tmp_path: Path) -> None:
     np.save(bad_dir / "y.npy", clean_bundle.y[:8])
     np.save(bad_dir / "subject_ids.npy", clean_bundle.subject_ids[:8])
     clean_bundle.metadata.iloc[:8].to_csv(bad_dir / "metadata.csv", index=False)
-    with open(PILOT_DATA_DIR / "splits.json", "r", encoding="utf-8") as f:
+    with open(PROCESSED_DATA_DIR / "splits.json", "r", encoding="utf-8") as f:
         tampered_splits = json.load(f)
     tampered_splits["trial_uid_sha256"] = "0" * 64
     with open(bad_dir / "splits.json", "w", encoding="utf-8") as f:
@@ -279,20 +276,20 @@ def _assert_smoke_outputs_and_captum(
     assert attributions.abs().sum().item() > 0.0
 
 
-def test_end_to_end_smoke_on_processed_pilot(tmp_path: Path) -> None:
-    """Smoke test 2 epochs trên data/processed_pilot cho P300ATCNet + Captum IG."""
-    if not (PILOT_DATA_DIR / "X_clean.npy").exists():
-        pytest.skip("Không tìm thấy data/processed_pilot để chạy smoke test.")
+def test_end_to_end_smoke_on_processed_data(tmp_path: Path) -> None:
+    """Smoke test 2 epochs trên data/processed cho P300ATCNet + Captum IG."""
+    if not (PROCESSED_DATA_DIR / "X_clean.npy").exists():
+        pytest.skip("Không tìm thấy data/processed để chạy smoke test.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bundle = load_eeg_dataset(PILOT_DATA_DIR, data_variant="clean")
+    bundle = load_eeg_dataset(PROCESSED_DATA_DIR, data_variant="clean")
 
     # 1. P300ATCNet (avg_pool) trên 1 fold cross_subject_5fold
     t1 = time.perf_counter()
     rc2 = train_dl2_main(
         [
             "--data-dir",
-            str(PILOT_DATA_DIR),
+            str(PROCESSED_DATA_DIR),
             "--data-variant",
             "clean",
             "--model",
@@ -330,7 +327,7 @@ def test_end_to_end_smoke_on_processed_pilot(tmp_path: Path) -> None:
     rc3 = train_dl2_main(
         [
             "--data-dir",
-            str(PILOT_DATA_DIR),
+            str(PROCESSED_DATA_DIR),
             "--data-variant",
             "clean",
             "--model",

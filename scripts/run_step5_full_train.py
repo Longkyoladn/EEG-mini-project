@@ -309,7 +309,6 @@ def generate_step5_report(
     metrics_dir: Path,
     audit_csv_path: Path,
     report_path: Path,
-    runtime_info: Dict[str, Any],
 ) -> Path:
     """Sinh báo cáo `reports/STEP5_FULL_RESULTS.md` gồm đúng 4 bảng phân tích."""
     loaded: Dict[str, Dict[str, Any]] = {
@@ -506,7 +505,6 @@ def run_step5_pipeline(
 ) -> Path:
     """Chạy toàn bộ pipeline Bước 5, kiểm tra toàn vẹn, xuất bàn giao và sinh báo cáo."""
     metrics_dir = output_dir / "metrics" / "dl2"
-    runtime_json_path = metrics_dir / "step5_runtime_summary.json"
     common_args = [
         "--epochs", "80",
         "--patience", "15",
@@ -517,20 +515,11 @@ def run_step5_pipeline(
     ]
 
     if not report_only:
-        t_all_start = time.perf_counter()
-
         # Nhóm 1 — Bắt buộc
         for idx, spec in enumerate(GROUP1_SPECS, start=1):
             print(f"\n========== [Nhóm 1 | {idx}/{len(GROUP1_SPECS)}] {spec.exp_name} ==========")
             _run_spec(spec, data_dir, output_dir, common_args)
 
-        total_wall = time.perf_counter() - t_all_start
-        runtime_info: Dict[str, Any] = {"total_wall_sec": total_wall}
-        metrics_dir.mkdir(parents=True, exist_ok=True)
-        with open(runtime_json_path, "w", encoding="utf-8") as f:
-            json.dump(runtime_info, f, indent=2)
-    else:
-        runtime_info = _load_json(runtime_json_path) if runtime_json_path.exists() else {}
 
     handover_paths = export_handover_files(
         data_dir=data_dir,
@@ -547,7 +536,6 @@ def run_step5_pipeline(
         metrics_dir=metrics_dir,
         audit_csv_path=audit_csv_path,
         report_path=report_path,
-        runtime_info=runtime_info,
     )
     print(f"[step5] Generated report: {saved_report}")
     return saved_report
