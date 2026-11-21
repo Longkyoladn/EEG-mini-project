@@ -383,7 +383,7 @@ def _load_external_benchmark_rows(external_dir: Optional[Path]) -> List[Dict[str
         return []
     rows: List[Dict[str, Any]] = []
     for csv_path in sorted(external_dir.glob("*.csv")):
-        if csv_path.stem.startswith(("p300_atcnet_", "eegnet_")):
+        if csv_path.stem.startswith("p300_atcnet_"):
             continue
         try:
             df = pd.read_csv(csv_path)
@@ -420,7 +420,7 @@ def plot_fig3_benchmark_rq1_rq2(
     *,
     external_results_dir: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
-    """Fig 3: So sánh phân bố 39 subjects (EEGNet-v4 vs P300-ATCNet WS/LOSO) + Ablation & Sensitivity."""
+    """Fig 3: Phân bố 39 subjects (P300-ATCNet Within vs LOSO) + CS5 Clean vs No-ICA & Sensitivity (39/37/31)."""
     setup_publication_style()
     handover_df = pd.read_csv(metrics_dir / "handover_per_subject_summary_dl2.csv")
     qc_df = pd.read_csv(data_dir / "preprocessing_qc_summary.csv")
@@ -428,9 +428,8 @@ def plot_fig3_benchmark_rq1_rq2(
 
     # Thu thập dữ liệu Panel (a): Boxplot + jittered points
     models_a = [
-        ("WS\nEEGNet-v4", handover_df["eegnet_ws_roc_auc"].to_numpy(), handover_df["eegnet_ws_balanced_accuracy"].to_numpy(), OKABE_ITO["sky"]),
-        ("WS\nP300-ATCNet", handover_df["ws_roc_auc"].to_numpy(), handover_df["ws_balanced_accuracy"].to_numpy(), OKABE_ITO["blue"]),
-        ("LOSO\nP300-ATCNet", handover_df["loso_roc_auc"].to_numpy(), handover_df["loso_balanced_accuracy"].to_numpy(), OKABE_ITO["orange"]),
+        ("Within-Subject\nP300-ATCNet", handover_df["ws_roc_auc"].to_numpy(), handover_df["ws_balanced_accuracy"].to_numpy(), OKABE_ITO["blue"]),
+        ("Cross-Subject LOSO\nP300-ATCNet", handover_df["loso_roc_auc"].to_numpy(), handover_df["loso_balanced_accuracy"].to_numpy(), OKABE_ITO["orange"]),
     ]
 
     ext_rows = _load_external_benchmark_rows(external_results_dir)
@@ -483,13 +482,10 @@ def plot_fig3_benchmark_rq1_rq2(
         ax1.scatter(positions_ba[idx] + jit, ba_vals, s=13, facecolors="white", edgecolors=col, linewidths=0.8, alpha=0.75, zorder=3)
 
     # Wilcoxon stars cho ROC-AUC
-    w_ws = stats.wilcoxon(handover_df["eegnet_ws_roc_auc"], handover_df["ws_roc_auc"]).pvalue
     w_loso = stats.wilcoxon(handover_df["ws_roc_auc"], handover_df["loso_roc_auc"]).pvalue
-    idx_eeg = n_groups - 3
     idx_ws = n_groups - 2
     idx_lo = n_groups - 1
-    _add_sig_bracket(ax1, positions_roc[idx_eeg], positions_roc[idx_ws], 1.008, 0.012, f"ROC: {_p_to_stars(w_ws)} ({_fmt_p_text(w_ws)})", fontsize=7.6)
-    _add_sig_bracket(ax1, positions_roc[idx_ws], positions_roc[idx_lo], 1.045, 0.012, f"ROC: {_p_to_stars(w_loso)} ({_fmt_p_text(w_loso)})", fontsize=7.6)
+    _add_sig_bracket(ax1, positions_roc[idx_ws], positions_roc[idx_lo], 1.030, 0.012, f"ROC: {_p_to_stars(w_loso)} ({_fmt_p_text(w_loso)})", fontsize=7.6)
 
     ax1.set_xticks(np.arange(n_groups) * 2.2)
     ax1.set_xticklabels([m[0] for m in models_a])
@@ -506,12 +502,11 @@ def plot_fig3_benchmark_rq1_rq2(
     ]
     ax1.legend(handles=legend_handles, loc="lower left", frameon=True, framealpha=0.9, edgecolor="none")
 
-    # Panel (b): Ablation Readout (CS5 Pilot) & Sensitivity Analysis (39 vs 37 vs 31)
+    # Panel (b): CS5 Clean vs No-ICA & Sensitivity Analysis (39 vs 37 vs 31)
     ax2 = fig.add_subplot(gs[1])
     ablation_specs = [
-        ("avg\npool", "metrics_pilot_cs5_atcnet_avg.json", OKABE_ITO["sky"]),
-        ("attn\npool", "metrics_pilot_cs5_atcnet_attn.json", OKABE_ITO["blue"]),
-        ("last\nstep", "metrics_pilot_cs5_atcnet_last.json", OKABE_ITO["purple"]),
+        ("CS5\nClean", "metrics_dl2_cs5_p300_atcnet_clean.json", OKABE_ITO["sky"]),
+        ("CS5\nNo-ICA", "metrics_dl2_cs5_p300_atcnet_no_ica.json", OKABE_ITO["purple"]),
     ]
     x_pos: List[float] = []
     labels_b: List[str] = []
@@ -562,19 +557,19 @@ def plot_fig3_benchmark_rq1_rq2(
         ax2.text(xp - w_bar / 2, rm + rs + 0.008, f"{rm:.3f}", ha="center", va="bottom", fontsize=7.2, rotation=90)
         ax2.text(xp + w_bar / 2, pm + ps + 0.008, f"{pm:.3f}", ha="center", va="bottom", fontsize=7.2, rotation=90)
 
-    if len(x_arr) >= 6:
-        sep_x = 0.5 * (x_arr[2] + x_arr[3])
+    if len(x_arr) >= 5:
+        sep_x = 0.5 * (x_arr[1] + x_arr[2])
         ax2.axvline(sep_x, color=OKABE_ITO["grey"], ls="--", lw=1.0)
-        ax2.text(x_arr[1], 1.115, "Readout Ablation (CS 5-Fold)", ha="center", fontsize=8.3, fontweight="bold", color=OKABE_ITO["black"])
-        ax2.text(x_arr[4], 1.115, "Cohort Sensitivity (LOSO)", ha="center", fontsize=8.3, fontweight="bold", color=OKABE_ITO["black"])
+        ax2.text(0.5 * (x_arr[0] + x_arr[1]), 1.105, "ICA Ablation\n(CS 5-Fold)", ha="center", va="bottom", fontsize=8.3, fontweight="bold", color=OKABE_ITO["black"])
+        ax2.text(x_arr[3], 1.105, "Cohort Sensitivity (LOSO)", ha="center", va="bottom", fontsize=8.3, fontweight="bold", color=OKABE_ITO["black"])
 
     ax2.set_xticks(x_arr)
     ax2.set_xticklabels(labels_b, fontsize=8.0)
-    ax2.set_ylim(0.70, 1.145)
+    ax2.set_ylim(0.70, 1.27)
     ax2.set_ylabel("Score (Mean ± SD)")
-    ax2.set_title("(b) Architecture Ablation & Cohort Sensitivity")
+    ax2.set_title("(b) ICA Ablation & Cohort Sensitivity")
     ax2.grid(True, axis="y", alpha=0.25)
-    ax2.legend(loc="lower right", frameon=True, framealpha=0.92, edgecolor="none", fontsize=7.8)
+    ax2.legend(loc="upper center", ncol=2, frameon=True, framealpha=0.92, edgecolor="none", fontsize=7.8)
 
     return _save_figure(fig, out_dir, "fig3_benchmark_rq1_rq2")
 
@@ -617,8 +612,6 @@ def _format_npz_label(stem: str) -> str:
         "p300_atcnet_within": "P300-ATCNet Within (5-Fold)",
         "p300_atcnet_loso": "P300-ATCNet LOSO (39 Subs)",
         "p300_atcnet_cs5_clean": "P300-ATCNet CS5 (Clean)",
-        "eegnet_within": "EEGNet-v4 Within (5-Fold)",
-        "eegnet_cs5_clean": "EEGNet-v4 CS5 (Clean)",
     }
     return mapping.get(clean, clean.replace("_", " ").title())
 
@@ -704,7 +697,7 @@ def plot_fig3b_roc_pr_curves(
     dl2_preview_specs = [
         ("p300_atcnet_loso_preds.npz", "predictions_dl2_loso_p300_atcnet.csv", "P300-ATCNet LOSO (39 Subs)", OKABE_ITO["orange"], "-"),
         ("p300_atcnet_within_preds.npz", "predictions_dl2_ws_p300_atcnet.csv", "P300-ATCNet Within (5-Fold)", OKABE_ITO["blue"], "-"),
-        ("eegnet_within_preds.npz", "predictions_dl2_ws_eegnet.csv", "EEGNet-v4 Within (5-Fold)", OKABE_ITO["sky"], "--"),
+        ("p300_atcnet_cs5_clean_preds.npz", "predictions_dl2_cs5_p300_atcnet_clean.csv", "P300-ATCNet CS5 (Clean)", OKABE_ITO["green"], "--"),
     ]
     palette_cycle = [
         OKABE_ITO["green"],

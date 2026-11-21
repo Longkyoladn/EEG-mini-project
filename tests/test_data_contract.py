@@ -3,7 +3,7 @@
 Tệp: tests/test_data_contract.py
 
 Đọc đường dẫn dữ liệu từ biến môi trường `EEG_DATA_DIR` (mặc định dùng
-`data/processed` nếu đã tồn tại `X_clean.npy`, ngược lại dùng `data/processed_pilot`).
+`data/processed`).
 """
 
 from __future__ import annotations
@@ -36,10 +36,7 @@ def _resolve_data_dir() -> Path:
     env_dir = os.environ.get("EEG_DATA_DIR")
     if env_dir:
         return Path(env_dir)
-    default_prod = Path("data/processed")
-    if (default_prod / "X_clean.npy").exists():
-        return default_prod
-    return Path("data/processed_pilot")
+    return Path("data/processed")
 
 
 @pytest.fixture(scope="module")

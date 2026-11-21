@@ -10,7 +10,6 @@ data/raw/oddball_data/*
 data/processed/*
 data/processed/*.npy
 !data/processed/.gitkeep
-data/processed_pilot/
 
 # EEG / data file formats & partial downloads
 *.eeg

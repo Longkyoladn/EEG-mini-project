@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from captum.attr import IntegratedGradients
 
-from src.models import EEGNetV4, P300ATCNet
+from src.models import P300ATCNet
 
 
 def _available_devices() -> List[str]:
@@ -21,7 +21,7 @@ def _available_devices() -> List[str]:
 
 
 @pytest.mark.parametrize("device", _available_devices())
-@pytest.mark.parametrize("model_cls", [EEGNetV4, P300ATCNet])
+@pytest.mark.parametrize("model_cls", [P300ATCNet])
 def test_shapes_and_forward_backward(model_cls: type[nn.Module], device: str) -> None:
     """Kiểm tra forward shape `(4, 1)`, dtype float32 và backward trên CPU/CUDA."""
     torch.manual_seed(42)
@@ -42,7 +42,7 @@ def test_shapes_and_forward_backward(model_cls: type[nn.Module], device: str) ->
     assert torch.isfinite(x.grad).all()
 
 
-@pytest.mark.parametrize("model_cls", [EEGNetV4, P300ATCNet])
+@pytest.mark.parametrize("model_cls", [P300ATCNet])
 @pytest.mark.parametrize(
     "bad_shape",
     [
@@ -100,7 +100,6 @@ def test_p300_atcnet_variants(
 def test_parameter_budget() -> None:
     """Kiểm tra ngân sách tham số và in bảng tổng hợp cho các cấu hình."""
     configs = [
-        ("EEGNetV4 (default)", EEGNetV4()),
         ("P300ATCNet (default: n_win=2, shared=False, avg_pool)", P300ATCNet()),
         (
             "P300ATCNet (n_win=2, shared=False, attn_pool)",
@@ -133,10 +132,8 @@ def test_parameter_budget() -> None:
         counts[name] = n_params
         print(f"{name:<56} | {n_params:>16,}")
 
-    eegnet_params = counts["EEGNetV4 (default)"]
     atc_default_params = counts["P300ATCNet (default: n_win=2, shared=False, avg_pool)"]
 
-    assert eegnet_params < 10_000
     assert 30_000 <= atc_default_params <= 65_000
     assert 35_000 <= atc_default_params <= 60_000
 
@@ -144,7 +141,6 @@ def test_parameter_budget() -> None:
 @pytest.mark.parametrize(
     "model_factory,spatial_limit,linear_limit",
     [
-        (lambda: EEGNetV4(spatial_max_norm=1.0, linear_max_norm=0.25), 1.0, 0.25),
         (lambda: P300ATCNet(spatial_max_norm=2.0, linear_max_norm=0.25), 2.0, 0.25),
         (
             lambda: P300ATCNet(
@@ -219,25 +215,19 @@ def test_gradients_and_max_norm(
 
 def test_get_spatial_weights() -> None:
     """Kiểm tra helper get_spatial_weights() trả về bản sao đúng chiều 127 kênh."""
-    eegnet = EEGNetV4()
-    w_eeg = eegnet.get_spatial_weights()
-    assert w_eeg.shape == (16, 1, 127, 1)
-    assert not w_eeg.requires_grad
-
-    w_eeg_orig = eegnet.spatial_conv.weight.detach().clone()
-    w_eeg.zero_()
-    assert torch.equal(eegnet.spatial_conv.weight.detach(), w_eeg_orig)
-
     atcnet = P300ATCNet()
     w_atc = atcnet.get_spatial_weights()
     assert w_atc.shape == (32, 1, 127, 1)
     assert not w_atc.requires_grad
 
+    w_atc_orig = atcnet.spatial_conv.weight.detach().clone()
+    w_atc.zero_()
+    assert torch.equal(atcnet.spatial_conv.weight.detach(), w_atc_orig)
+
 
 @pytest.mark.parametrize(
     "label,model_factory",
     [
-        ("EEGNetV4", lambda: EEGNetV4()),
         ("P300ATCNet(avg_pool)", lambda: P300ATCNet(readout="avg_pool")),
         ("P300ATCNet(attn_pool)", lambda: P300ATCNet(readout="attn_pool")),
     ],
