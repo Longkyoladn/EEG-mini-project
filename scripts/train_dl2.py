@@ -1,7 +1,7 @@
 """CLI chạy thực nghiệm huấn luyện & đánh giá DL2 chuẩn Zero Leakage.
 
 Ví dụ:
-    py -3.14 scripts/train_dl2.py --data-dir data/processed_pilot --model p300_atcnet \
+    py -3.14 scripts/train_dl2.py --data-dir data/processed --model p300_atcnet \
         --protocol cross_subject_5fold --epochs 2 --exp-name smoke_atcnet
 """
 
