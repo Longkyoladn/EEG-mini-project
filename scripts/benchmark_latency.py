@@ -22,7 +22,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.models import EEGNetV4, P300ATCNet
+from src.models import P300ATCNet
 
 
 def benchmark_model_on_device(
@@ -98,7 +98,7 @@ def run_latency_benchmark(
     n_warmup: int = 50,
     n_runs: int = 500,
 ) -> Dict[str, Any]:
-    """Chạy benchmark cho P300ATCNet (attn_pool) & EEGNetV4 trên GPU và CPU."""
+    """Chạy benchmark cho P300ATCNet (attn_pool) trên GPU và CPU."""
     devices: List[str] = []
     if torch.cuda.is_available():
         devices.append("cuda")
@@ -106,7 +106,6 @@ def run_latency_benchmark(
 
     model_specs: List[Tuple[str, Callable[[], nn.Module]]] = [
         ("P300ATCNet (attn_pool)", lambda: P300ATCNet(n_channels=127, n_times=251, readout="attn_pool")),
-        ("EEGNetV4", lambda: EEGNetV4(n_channels=127, n_times=251)),
     ]
 
     results: List[Dict[str, Any]] = []
@@ -160,7 +159,7 @@ def run_latency_benchmark(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Đo Inference Latency (ms/epoch) cho P300ATCNet & EEGNetV4.")
+    parser = argparse.ArgumentParser(description="Đo Inference Latency (ms/epoch) cho P300ATCNet (attn_pool).")
     parser.add_argument(
         "--output",
         type=Path,
