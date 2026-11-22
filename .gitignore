@@ -41,6 +41,10 @@ results/handover_standard/*.npz
 !results/figures/paper/*.png
 !results/figures/paper/*.pdf
 !results/metrics/dl2/
+!results/metrics/dl1/
+results/metrics/dl1/*
+!results/metrics/dl1/*.json
+!results/metrics/dl1/handover_per_subject_summary_dl1.csv
 results/metrics/dl2/*
 !results/metrics/dl2/*.json
 !results/metrics/dl2/handover_per_subject_summary_dl2.csv
@@ -70,6 +74,7 @@ env/
 
 # ── Jupyter & editors ──────────────────────────
 .ipynb_checkpoints/
+/notebooks/00_colab_setup.ipynb
 .vscode/
 .idea/
 
