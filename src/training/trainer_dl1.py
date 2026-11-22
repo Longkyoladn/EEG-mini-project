@@ -108,10 +108,9 @@ def train_single_fold(
             optimizer.step()
             model.apply_max_norm()
             batch_losses.append(loss.item())
-            if step % 5 == 0 or step == n_batches:
+            if step % 20 == 0 or step == n_batches:
                 print(
-                    f"\r  [{fold['fold_key']}] Epoch {epoch:2d}/{epochs} | Batch {step:3d}/{n_batches} | batch_loss={loss.item():.4f}",
-                    end="",
+                    f"  [{fold['fold_key']}] Epoch {epoch:2d}/{epochs} | Batch {step:3d}/{n_batches} | batch_loss={loss.item():.4f}",
                     flush=True,
                 )
         scheduler.step()
@@ -128,7 +127,7 @@ def train_single_fold(
         marker = " ✓" if is_best else ""
         no_improve = epoch - best_epoch
         print(
-            f"\r  [{fold['fold_key']}] Epoch {epoch:2d}/{epochs} | loss={train_loss:.4f}"
+            f"  [{fold['fold_key']}] Epoch {epoch:2d}/{epochs} | loss={train_loss:.4f}"
             f" | val_auc={metrics['roc_auc']:.4f}"
             f" | val_ba={metrics['balanced_accuracy']:.4f}"
             f" | best_ep={best_epoch} (+{no_improve}){marker}",

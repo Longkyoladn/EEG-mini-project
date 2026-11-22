@@ -101,7 +101,7 @@ def run_dl1_protocol(bundle, protocol, reference_file, label, mode, results_dir)
                   f"BA={saved['metrics']['balanced_accuracy']:.4f}, "
                   f"{result['train_time_sec']:.1f} giây", flush=True)
         else:
-            print(f"[{number}/{len(specs)}] Dùng lại {label} {key}")
+            print(f"[{number}/{len(specs)}] Dùng lại {label} {key}", flush=True)
         if write_cache:
             saved["metrics"].update(best_epoch=saved["best_epoch"], threshold=saved["threshold"])
             tmp_pred = pred_file.with_suffix(".csv.tmp")
@@ -142,7 +142,7 @@ def run_dl1_protocol(bundle, protocol, reference_file, label, mode, results_dir)
             y_pred=pred["y_pred"].to_numpy(dtype=np.int64))
         for path in stage.iterdir():
             shutil.move(str(path), str(handover / path.name))
-    print(f"Đã xuất {len(scores)} fold và {len(pred)} dự đoán: {handover / prefix}")
+    print(f"Đã xuất {len(scores)} fold và {len(pred)} dự đoán: {handover / prefix}", flush=True)
 
 
 def _save_subject_summary(results_dir, data_dir):
