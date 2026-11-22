@@ -187,19 +187,29 @@ def main(argv=None):
     parser.add_argument("--results-dir", type=Path, required=True, help="Thư mục lưu kết quả")
     parser.add_argument("--mode", choices=("pilot", "full", "cs5-pilot"), default="pilot")
     args = parser.parse_args(argv)
-    print("Thiết bị train:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU", flush=True)
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    print("=" * 60, flush=True)
+    print(f">>> KHỞI ĐỘNG TRAIN DL1 (MS-CNN-BiGRU) | Mode: {args.mode.upper()}", flush=True)
+    print(f">>> Thiết bị huấn luyện: {device_name}", flush=True)
+    print(f">>> Data directory: {args.data_dir}", flush=True)
+    print(f">>> Results directory: {args.results_dir}", flush=True)
+    print("=" * 60, flush=True)
     if args.mode == "cs5-pilot":
         run_cs5_pilot(args.data_dir, args.results_dir)
         return
+    print(f">>> [1/3] Đang tải và kiểm tra dữ liệu từ {args.data_dir}...", flush=True)
     bundle = load_eeg_dataset(args.data_dir, data_variant="clean")
+    print(f"-> Nạp thành công: {len(bundle.metadata)} trials, {len(set(bundle.subject_ids))} subjects.", flush=True)
     for protocol, reference, label in [
         ("within_subject", "within_5fold.json", "within"),
         ("cross_subject_loso", "loso.json", "loso"),
     ]:
+        print(f"\n>>> [2/3] Bắt đầu giao thức: {label.upper()} ({protocol})", flush=True)
         run_dl1_protocol(bundle, protocol, reference, label, args.mode, args.results_dir)
     if args.mode == "full":
+        print("\n>>> [3/3] Đang tổng hợp báo cáo kết quả theo từng subject...", flush=True)
         _save_subject_summary(args.results_dir, args.data_dir)
-    print(f"Hoàn tất {args.mode}: {args.results_dir / 'metrics' / 'dl1'}")
+    print(f"\n{'='*60}\n>>> HOÀN TẤT TOÀN BỘ {args.mode.upper()}: {args.results_dir / 'metrics' / 'dl1'}\n{'='*60}", flush=True)
 
 
 if __name__ == "__main__":

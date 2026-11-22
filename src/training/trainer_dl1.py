@@ -84,7 +84,9 @@ def train_single_fold(
     torch.backends.cudnn.benchmark = False
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     start = time.perf_counter()
+    print(f"  [{fold['fold_key']}] Đang chuẩn hóa kênh tín hiệu (fit scaler trên {len(tr)} trials)...", flush=True)
     scaler = fit_fold_scaler(bundle.X, tr)
+    print(f"  [{fold['fold_key']}] Chuẩn hóa xong! Bắt đầu huấn luyện {epochs} epoch...", flush=True)
     train_loader = DataLoader(FoldDataset(bundle, tr, scaler), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(FoldDataset(bundle, va, scaler), batch_size=batch_size)
     test_loader = DataLoader(FoldDataset(bundle, te, scaler), batch_size=batch_size)
@@ -94,10 +96,11 @@ def train_single_fold(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     best_epoch, best_score = 0, -np.inf
     epoch_losses = []
+    n_batches = len(train_loader)
     for epoch in range(1, epochs + 1):
         model.train()
         batch_losses = []
-        for x, y in train_loader:
+        for step, (x, y) in enumerate(train_loader, 1):
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(x.to(device)), y.to(device))
             loss.backward()
@@ -105,6 +108,12 @@ def train_single_fold(
             optimizer.step()
             model.apply_max_norm()
             batch_losses.append(loss.item())
+            if step % 5 == 0 or step == n_batches:
+                print(
+                    f"\r  [{fold['fold_key']}] Epoch {epoch:2d}/{epochs} | Batch {step:3d}/{n_batches} | batch_loss={loss.item():.4f}",
+                    end="",
+                    flush=True,
+                )
         scheduler.step()
         train_loss = float(np.mean(batch_losses))
         epoch_losses.append(train_loss)
@@ -119,7 +128,7 @@ def train_single_fold(
         marker = " ✓" if is_best else ""
         no_improve = epoch - best_epoch
         print(
-            f"  Epoch {epoch:3d}/{epochs} | loss={train_loss:.4f}"
+            f"\r  [{fold['fold_key']}] Epoch {epoch:2d}/{epochs} | loss={train_loss:.4f}"
             f" | val_auc={metrics['roc_auc']:.4f}"
             f" | val_ba={metrics['balanced_accuracy']:.4f}"
             f" | best_ep={best_epoch} (+{no_improve}){marker}",
