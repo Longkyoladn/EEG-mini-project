@@ -92,23 +92,40 @@ def train_single_fold(
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     best_epoch, best_score = 0, -np.inf
+    epoch_losses = []
     for epoch in range(1, epochs + 1):
         model.train()
+        batch_losses = []
         for x, y in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            loss_fn(model(x.to(device)), y.to(device)).backward()
+            loss = loss_fn(model(x.to(device)), y.to(device))
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             model.apply_max_norm()
+            batch_losses.append(loss.item())
         scheduler.step()
+        train_loss = float(np.mean(batch_losses))
+        epoch_losses.append(train_loss)
         val_prob = _predict(model, val_loader, device)
         metrics = compute_binary_metrics(bundle.y[va], val_prob, threshold=0.5)
         score = metrics["roc_auc"] if np.isfinite(metrics["roc_auc"]) else metrics["balanced_accuracy"]
-        if score > best_score + 1e-4:
+        is_best = score > best_score + 1e-4
+        if is_best:
             best_score, best_epoch = float(score), epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_val_prob = val_prob
-        elif epoch - best_epoch >= patience:
+        marker = " ✓" if is_best else ""
+        no_improve = epoch - best_epoch
+        print(
+            f"  Epoch {epoch:3d}/{epochs} | loss={train_loss:.4f}"
+            f" | val_auc={metrics['roc_auc']:.4f}"
+            f" | val_ba={metrics['balanced_accuracy']:.4f}"
+            f" | best_ep={best_epoch} (+{no_improve}){marker}",
+            flush=True,
+        )
+        if not is_best and no_improve >= patience:
+            print(f"  Early stop tại epoch {epoch} (patience={patience}).", flush=True)
             break
 
     if not best_epoch:
