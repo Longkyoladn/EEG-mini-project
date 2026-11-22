@@ -1,6 +1,7 @@
 """Huấn luyện và đánh giá MS-CNN-BiGRU trên một fold đã khóa."""
 
 import random
+import shutil
 import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -147,7 +148,7 @@ def train_single_fold(
                             best_epoch=best_epoch, best_val_metric=best_score, seed=seed,
                             n_times=bundle.X.shape[2], trial_uid_sha256=bundle.trial_uid_sha256,
                             fold_meta=fold_meta), tmp)
-            tmp.replace(path)
+            shutil.move(str(tmp), str(path))
         finally:
             tmp.unlink(missing_ok=True)
 

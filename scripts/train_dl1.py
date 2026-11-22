@@ -87,7 +87,9 @@ def run_dl1_protocol(bundle, protocol, reference_file, label, mode, results_dir)
                     shutil.copyfile(old_weights, tmp_weights)
                     tmp_weights.replace(weights)
         if saved is not None and saved["run_id"] != run_id:
-            raise ValueError(f"{key}: cấu hình/mã nguồn đã đổi. Chọn thư mục kết quả mới.")
+            print(f"[{number}/{len(specs)}] run_id thay đổi, huấn luyện lại {label} {key}...", flush=True)
+            saved = None
+            write_cache = True
         if saved is None:
             print(f"[{number}/{len(specs)}] Train {label} {key}", flush=True)
             result = train_single_fold(bundle, fold, epochs=epochs, patience=15, seed=42,
@@ -104,10 +106,10 @@ def run_dl1_protocol(bundle, protocol, reference_file, label, mode, results_dir)
             saved["metrics"].update(best_epoch=saved["best_epoch"], threshold=saved["threshold"])
             tmp_pred = pred_file.with_suffix(".csv.tmp")
             save_predictions_csv(pd.DataFrame(saved["predictions"]), tmp_pred)
-            tmp_pred.replace(pred_file)
+            shutil.move(str(tmp_pred), str(pred_file))
             tmp = record.with_suffix(".json.tmp")
             tmp.write_text(json.dumps({**saved["metrics"], "run_id": run_id}), encoding="utf-8")
-            tmp.replace(record)
+            shutil.move(str(tmp), str(record))
         metrics.append(saved["metrics"])
         predictions.extend(saved["predictions"])
 
@@ -139,7 +141,7 @@ def run_dl1_protocol(bundle, protocol, reference_file, label, mode, results_dir)
             y_true=pred["y_true"].to_numpy(dtype=np.int64), y_prob=pred["y_prob"].to_numpy(dtype=np.float64),
             y_pred=pred["y_pred"].to_numpy(dtype=np.int64))
         for path in stage.iterdir():
-            path.replace(handover / path.name)
+            shutil.move(str(path), str(handover / path.name))
     print(f"Đã xuất {len(scores)} fold và {len(pred)} dự đoán: {handover / prefix}")
 
 
