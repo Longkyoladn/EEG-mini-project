@@ -12,7 +12,7 @@ from typing import Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
-from src.models.tree_ensembles import BinaryProbabilisticEstimator, TreeModelSpec
+from src.models.Ml3 import BinaryProbabilisticEstimator, TreeModelSpec
 
 ProtocolName = Literal["within", "loso"]
 
