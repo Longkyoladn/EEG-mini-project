@@ -1,7 +1,7 @@
 """Adapter xuất bộ bàn giao chuẩn Đề cương nhóm (Mục 3.5) và 3 file splits rời.
 
 Chạy độc lập, không train lại mô hình và không sinh lại seed khác:
-    py -3.14 scripts/export_group_handover.py
+    py -3.14 scripts/evaluation/export_group_handover.py
 """
 
 from __future__ import annotations
