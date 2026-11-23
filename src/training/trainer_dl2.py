@@ -20,7 +20,6 @@ from src.evaluation.metrics import (
     compute_binary_metrics,
     find_optimal_threshold,
 )
-from src.models.eegnet import EEGNetV4
 from src.models.p300_atcnet import P300ATCNet
 from src.training.dataset_dl2 import ChannelStandardScaler, EEGTrialDataset
 
@@ -39,12 +38,10 @@ def set_seed(seed: int) -> None:
 
 def _canonical_model_name(model_name: str) -> str:
     key = model_name.strip().lower()
-    if key in ("eegnet", "eegnetv4", "eegnet_v4"):
-        return "eegnet"
     if key in ("p300_atcnet", "atcnet", "p300atcnet"):
         return "p300_atcnet"
     raise ValueError(
-        f"model_name phải là 'eegnet' hoặc 'p300_atcnet', nhận được {model_name!r}."
+        f"model_name phải là 'p300_atcnet', nhận được {model_name!r}."
     )
 
 
@@ -63,7 +60,7 @@ def build_model(
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Khởi tạo mới hoàn toàn mô hình DL2 và chuẩn hóa kwargs để lưu checkpoint."""
     canonical = _canonical_model_name(model_name)
-    cls = EEGNetV4 if canonical == "eegnet" else P300ATCNet
+    cls = P300ATCNet
 
     sig = inspect.signature(cls.__init__)
     defaults: Dict[str, Any] = {

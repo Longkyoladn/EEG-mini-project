@@ -18,15 +18,35 @@ Bốn tinh chỉnh chuyên biệt cho dữ liệu P300 `(B, 127, 251)` @ 250 Hz:
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.eegnet import _compute_same_padding, _renorm_weight_
-
 ReadoutMode = Literal["avg_pool", "attn_pool", "last_step"]
+
+
+def _compute_same_padding(kernel_size: int) -> Tuple[int, int]:
+    """Tính cặp padding trái/phải để bảo toàn độ dài chuỗi thời gian."""
+    total_pad = kernel_size - 1
+    pad_left = total_pad // 2
+    pad_right = total_pad - pad_left
+    return pad_left, pad_right
+
+
+def _renorm_weight_(
+    weight: torch.Tensor,
+    max_norm: Optional[float],
+    dims: Tuple[int, ...],
+    eps: float = 1e-8,
+) -> None:
+    """Ràng buộc L2 max-norm in-place trên tensor trọng số (gọi trong no_grad)."""
+    if max_norm is None:
+        return
+    norms = weight.norm(p=2, dim=dims, keepdim=True)
+    scale = torch.clamp(max_norm / (norms + eps), max=1.0)
+    weight.mul_(scale)
 
 
 class _MultiHeadSelfAttentionBlock(nn.Module):

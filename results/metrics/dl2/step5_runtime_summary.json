@@ -1,9 +1,0 @@
-{
-  "total_wall_sec": 8502.631922400004,
-  "t_ws_eegnet_sec": 699.5077519999395,
-  "eegnet_loso_probe_sec_per_ep": 5.87467829999999,
-  "eegnet_loso_est_mean_epochs": 44.2,
-  "est_loso_eegnet_sec": 10126.770453539983,
-  "est_group2_total_sec": 10826.278205539922,
-  "loso_eegnet_executed": false
-}

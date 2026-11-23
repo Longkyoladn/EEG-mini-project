@@ -10,7 +10,6 @@ data/raw/oddball_data/*
 data/processed/*
 data/processed/*.npy
 !data/processed/.gitkeep
-data/processed_pilot/
 
 # EEG / data file formats & partial downloads
 *.eeg
@@ -36,8 +35,8 @@ results/checkpoints/*
 
 # Allow lightweight handover & paper figures (< 2 MB each), block heavy caches
 !results/handover_standard/
-!results/handover_standard/*.csv
-!results/handover_standard/*.npz
+results/handover_standard/*.csv
+results/handover_standard/*.npz
 !results/figures/paper/
 !results/figures/paper/*.png
 !results/figures/paper/*.pdf

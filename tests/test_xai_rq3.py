@@ -353,8 +353,6 @@ def test_step68_handover_splits_latency_and_fig3b() -> None:
         "p300_atcnet_loso_per_fold.csv": 39,
         "p300_atcnet_cs5_clean_per_fold.csv": 5,
         "p300_atcnet_cs5_no_ica_per_fold.csv": 5,
-        "eegnet_within_per_fold.csv": 195,
-        "eegnet_cs5_clean_per_fold.csv": 5,
     }
     for fname, n_rows in csv_specs.items():
         p = handover_dir / fname
@@ -372,8 +370,6 @@ def test_step68_handover_splits_latency_and_fig3b() -> None:
         "p300_atcnet_within_preds.npz",
         "p300_atcnet_loso_preds.npz",
         "p300_atcnet_cs5_clean_preds.npz",
-        "eegnet_within_preds.npz",
-        "eegnet_cs5_clean_preds.npz",
     ]
     req_arrays = {"subject_id", "fold", "trial_idx", "trial_uid", "y_true", "y_prob", "y_pred"}
     meta_labels = meta_df["label"].to_numpy(dtype=np.int64)
@@ -408,10 +404,8 @@ def test_step68_handover_splits_latency_and_fig3b() -> None:
     lat = json.loads(latency_path.read_text(encoding="utf-8"))
     pairs = {(b["model_name"], b["device"]): b for b in lat["benchmarks"]}
     assert ("P300ATCNet (attn_pool)", "cpu") in pairs
-    assert ("EEGNetV4", "cpu") in pairs
     if torch.cuda.is_available():
         assert ("P300ATCNet (attn_pool)", "cuda") in pairs
-        assert ("EEGNetV4", "cuda") in pairs
     for b in lat["benchmarks"]:
         assert b["mean_ms"] > 0.0 and b["median_ms"] > 0.0 and b["p95_ms"] > 0.0
 
