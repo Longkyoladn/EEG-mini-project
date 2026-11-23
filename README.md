@@ -100,3 +100,11 @@ python scripts/download_oddball.py
 5. **Đánh giá (`results/` & `reports/`)**:
    - Cross-Validation (Within-subject và Cross-subject).
    - Đánh giá qua các chỉ số: Balanced Accuracy, F1-Score, ROC-AUC.
+
+### Huấn luyện DL1
+
+```powershell
+python scripts/train_dl1.py --data-dir data/processed --results-dir results
+```
+
+DL1 chạy lần lượt **Within-subject** (195 fold), **LOSO** (39 fold) và **Cross-subject 5-fold** (5 fold cho `clean`, sau đó 5 fold cho `no_ica`). Dùng `--mode pilot` để kiểm tra nhanh cùng thứ tự, mỗi lượt 1 fold và 1 epoch. Khi chạy lại, script dùng lại các fold đã hoàn tất.
