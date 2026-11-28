@@ -22,6 +22,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--handover-dir",
         type=Path,
         default=Path("results/handover_standard"),
+        help=(
+            "Root handover directory containing branch subfolders "
+            "(e.g. results/handover_standard/DL2, results/handover_standard/Ml3)."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser

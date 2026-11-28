@@ -116,18 +116,54 @@ def validate_predictions_npz(path: Path) -> list[ValidationIssue]:
     return issues
 
 
+def _is_visible_relative_path(path: Path, root: Path) -> bool:
+    return not any(part.startswith(".") for part in path.relative_to(root).parts)
+
+
+def discover_handover_artifacts(directory: Path) -> tuple[list[Path], list[Path]]:
+    """Find handover CSV and NPZ artifacts in ``directory`` and its branch subfolders."""
+
+    if not directory.exists():
+        return [], []
+    if directory.is_file():
+        csv_paths = [directory] if directory.name.endswith("_per_fold.csv") else []
+        npz_paths = [directory] if directory.name.endswith("_preds.npz") else []
+        return csv_paths, npz_paths
+
+    csv_paths = sorted(
+        path
+        for path in directory.rglob("*_per_fold.csv")
+        if path.is_file() and _is_visible_relative_path(path, directory)
+    )
+    npz_paths = sorted(
+        path
+        for path in directory.rglob("*_preds.npz")
+        if path.is_file() and _is_visible_relative_path(path, directory)
+    )
+    return csv_paths, npz_paths
+
+
 def validate_handover_directory(
     directory: Path,
     *,
     require_prediction_pair: bool = False,
 ) -> HandoverValidationReport:
-    """Validate every handover artifact present without assuming all members submitted."""
+    """Validate every handover artifact present across ``directory`` and branch subfolders."""
 
-    csv_paths = sorted(directory.glob("*_per_fold.csv"))
-    npz_paths = sorted(directory.glob("*_preds.npz"))
+    csv_paths, npz_paths = discover_handover_artifacts(directory)
     issues: list[ValidationIssue] = []
     if not csv_paths and not npz_paths:
         issues.append(ValidationIssue(directory, "no handover artifacts found"))
+
+    seen_names: dict[str, Path] = {}
+    for path in [*csv_paths, *npz_paths]:
+        previous = seen_names.get(path.name)
+        if previous is not None and previous != path:
+            issues.append(
+                ValidationIssue(path, f"duplicate artifact filename also present at {previous}")
+            )
+        else:
+            seen_names[path.name] = path
 
     for path in csv_paths:
         issues.extend(validate_per_fold_csv(path))
@@ -135,11 +171,15 @@ def validate_handover_directory(
         issues.extend(validate_predictions_npz(path))
 
     if require_prediction_pair:
-        csv_prefixes = {path.name.removesuffix("_per_fold.csv") for path in csv_paths}
-        npz_prefixes = {path.name.removesuffix("_preds.npz") for path in npz_paths}
-        for prefix in sorted(csv_prefixes - npz_prefixes):
-            issues.append(ValidationIssue(directory / f"{prefix}_preds.npz", "missing prediction pair"))
-        for prefix in sorted(npz_prefixes - csv_prefixes):
-            issues.append(ValidationIssue(directory / f"{prefix}_per_fold.csv", "missing per-fold pair"))
+        csv_stems = {path.with_name(path.name.removesuffix("_per_fold.csv")) for path in csv_paths}
+        npz_stems = {path.with_name(path.name.removesuffix("_preds.npz")) for path in npz_paths}
+        for stem in sorted(csv_stems - npz_stems):
+            issues.append(
+                ValidationIssue(stem.with_name(f"{stem.name}_preds.npz"), "missing prediction pair")
+            )
+        for stem in sorted(npz_stems - csv_stems):
+            issues.append(
+                ValidationIssue(stem.with_name(f"{stem.name}_per_fold.csv"), "missing per-fold pair")
+            )
 
     return HandoverValidationReport(len(csv_paths) + len(npz_paths), tuple(issues))
