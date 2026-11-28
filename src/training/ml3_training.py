@@ -1,4 +1,4 @@
-"""ML3 cross-subject (CS5 & LOSO) XGBoost training, checkpointing, metrics, and plots."""
+"""ML3 XGBoost training, checkpointing, metrics, and plots (CS5, LOSO & Within-Subject)."""
 
 from __future__ import annotations
 
@@ -81,12 +81,15 @@ from src.features.ml3_feature_store import (
 )
 from src.models.Ml3 import ML3XGBoostConfig, ML3XGBoostModel
 
-ProtocolName = Literal["cs5", "loso"]
+ProtocolName = Literal["cs5", "loso", "within"]
 
 SPLIT_FILE_BY_PROTOCOL: Dict[ProtocolName, Tuple[str, str]] = {
     "cs5": ("cross_5fold.json", "cross_subject_5fold"),
     "loso": ("loso.json", "cross_subject_loso"),
+    "within": ("within_5fold.json", "within_subject"),
 }
+
+WITHIN_MAIN_EXPERIMENTS: Tuple[str, ...] = ("combined_w5",)
 
 CANONICAL_EXPERIMENT_ORDER: Tuple[str, ...] = (
     "temporal",
@@ -143,14 +146,15 @@ def normalize_protocol_name(protocol: str) -> ProtocolName:
         "cross_subject_5fold": "cs5",
         "loso": "loso",
         "cross_subject_loso": "loso",
+        "within": "within",
+        "within_subject": "within",
+        "within_5fold": "within",
+        "ws": "within",
     }
-    if cleaned in {"within", "within_subject", "within_5fold", "ws"}:
-        raise ValueError(
-            "Within-subject protocol is intentionally not supported in ML3 v1; "
-            "use 'cs5' or 'loso'."
-        )
     if cleaned not in alias_map:
-        raise ValueError(f"Unsupported ML3 protocol {protocol!r}; expected 'cs5' or 'loso'")
+        raise ValueError(
+            f"Unsupported ML3 protocol {protocol!r}; expected 'cs5', 'loso', or 'within'"
+        )
     return alias_map[cleaned]
 
 
@@ -158,6 +162,8 @@ def default_experiments_for_protocol(protocol: ProtocolName) -> Tuple[str, ...]:
     norm = normalize_protocol_name(protocol)
     if norm == "cs5":
         return CS5_MAIN_EXPERIMENTS
+    if norm == "within":
+        return WITHIN_MAIN_EXPERIMENTS
     return LOSO_MAIN_EXPERIMENTS
 
 
@@ -236,6 +242,10 @@ class SubjectFoldSplit:
                 f"train&val={overlap_tv}, train&test={overlap_tt}, val&test={overlap_vt}"
             )
 
+    @property
+    def fold_key(self) -> str:
+        return f"fold_{self.fold:02d}"
+
     def split_signature(self) -> Dict[str, Any]:
         return {
             "protocol": self.protocol,
@@ -246,11 +256,106 @@ class SubjectFoldSplit:
         }
 
 
+@dataclass(frozen=True)
+class WithinFoldSplit:
+    """Trial-level train/val/test partition for one (subject_id, fold) in Within-Subject 5-Fold."""
+
+    protocol: ProtocolName
+    subject_id: str
+    fold: int
+    train_local_idx: Tuple[int, ...]
+    val_local_idx: Tuple[int, ...]
+    test_local_idx: Tuple[int, ...]
+    subject_n_trials: int
+
+    def __post_init__(self) -> None:
+        if self.protocol != "within":
+            raise ValueError(f"WithinFoldSplit requires protocol='within', got {self.protocol!r}")
+        if self.fold < 0:
+            raise ValueError(f"fold index must be non-negative, got {self.fold}")
+        if not self.subject_id:
+            raise ValueError("subject_id must be non-empty")
+        if not self.train_local_idx or not self.val_local_idx or not self.test_local_idx:
+            raise ValueError(
+                f"Within-subject split {self.subject_id} fold {self.fold} must have non-empty "
+                "train, val, and test indices"
+            )
+        s_tr = set(self.train_local_idx)
+        s_va = set(self.val_local_idx)
+        s_te = set(self.test_local_idx)
+        if (
+            len(s_tr) != len(self.train_local_idx)
+            or len(s_va) != len(self.val_local_idx)
+            or len(s_te) != len(self.test_local_idx)
+        ):
+            raise ValueError(
+                f"Duplicate trial indices in within-subject split {self.subject_id} fold {self.fold}"
+            )
+        if (s_tr & s_va) or (s_tr & s_te) or (s_va & s_te):
+            raise ValueError(
+                f"Trial leakage in within-subject split {self.subject_id} fold {self.fold}"
+            )
+        all_idx = s_tr | s_va | s_te
+        if min(all_idx) < 0 or max(all_idx) >= self.subject_n_trials:
+            raise ValueError(
+                f"Local trial index out of bounds [0, {self.subject_n_trials}) "
+                f"for {self.subject_id} fold {self.fold}"
+            )
+
+    @property
+    def fold_key(self) -> str:
+        return f"{self.subject_id}_fold_{self.fold:02d}"
+
+    @property
+    def train_subjects(self) -> Tuple[str, ...]:
+        return (self.subject_id,)
+
+    @property
+    def val_subjects(self) -> Tuple[str, ...]:
+        return (self.subject_id,)
+
+    @property
+    def test_subjects(self) -> Tuple[str, ...]:
+        return (self.subject_id,)
+
+    def split_signature(self) -> Dict[str, Any]:
+        def _hash_indices(idxs: Tuple[int, ...]) -> str:
+            return hashlib.sha256(",".join(str(i) for i in idxs).encode("utf-8")).hexdigest()[:16]
+
+        return {
+            "protocol": self.protocol,
+            "subject_id": self.subject_id,
+            "fold": int(self.fold),
+            "subject_n_trials": int(self.subject_n_trials),
+            "n_train": len(self.train_local_idx),
+            "n_val": len(self.val_local_idx),
+            "n_test": len(self.test_local_idx),
+            "train_idx_sha": _hash_indices(self.train_local_idx),
+            "val_idx_sha": _hash_indices(self.val_local_idx),
+            "test_idx_sha": _hash_indices(self.test_local_idx),
+        }
+
+
+FoldSplit = SubjectFoldSplit | WithinFoldSplit
+
+
+def _iter_fold_checkpoint_dirs(exp_dir: Path) -> List[Path]:
+    """Return sorted per-fold checkpoint directories (handles ``fold_*`` and ``sub-*_fold_*``)."""
+    if not exp_dir.is_dir():
+        return []
+    dirs = [
+        p
+        for p in exp_dir.iterdir()
+        if p.is_dir() and (p.name.startswith("fold_") or "_fold_" in p.name)
+    ]
+    return sorted(dirs, key=lambda p: _natural_sort_key(p.name))
+
+
 def load_ml3_splits(
     splits_dir: Path | str,
     protocol: ProtocolName | str,
-) -> Tuple[Tuple[SubjectFoldSplit, ...], Dict[str, Any]]:
-    """Load CS5 or LOSO subject folds directly from ``splits/*.json`` (no metadata.csv needed)."""
+) -> Tuple[Tuple[FoldSplit, ...], Dict[str, Any]]:
+    """Load CS5, LOSO, or Within-Subject folds directly from ``splits/*.json``."""
     norm = normalize_protocol_name(protocol)
     filename, json_key = SPLIT_FILE_BY_PROTOCOL[norm]
     split_path = Path(splits_dir) / filename
@@ -258,6 +363,69 @@ def load_ml3_splits(
         raise FileNotFoundError(f"Split file not found: {split_path}")
 
     raw = json.loads(split_path.read_text(encoding="utf-8"))
+
+    if norm == "within":
+        if json_key not in raw or not isinstance(raw[json_key], dict) or not raw[json_key]:
+            raise ValueError(f"Split file {split_path} is missing non-empty dict '{json_key}'")
+        within_folds: list[WithinFoldSplit] = []
+        subject_order = raw.get("subjects") or sorted(raw[json_key].keys(), key=_natural_sort_key)
+        for sub_id in subject_order:
+            if sub_id not in raw[json_key]:
+                raise ValueError(f"Subject {sub_id!r} missing from '{json_key}' in {split_path}")
+            entries = raw[json_key][sub_id]
+            if not isinstance(entries, list) or not entries:
+                raise ValueError(f"Empty fold list for subject {sub_id!r} in {split_path}")
+
+            first_union = sorted(
+                set(int(i) for i in entries[0]["train_idx"])
+                | set(int(i) for i in entries[0]["val_idx"])
+                | set(int(i) for i in entries[0]["test_idx"])
+            )
+            sub_offset = first_union[0]
+            sub_n_trials = len(first_union)
+            if first_union != list(range(sub_offset, sub_offset + sub_n_trials)):
+                raise ValueError(
+                    f"Within-subject indices for {sub_id!r} in {split_path} are not contiguous"
+                )
+
+            seen_sub_folds: set[int] = set()
+            for entry in entries:
+                fold_idx = int(entry["fold"])
+                if fold_idx in seen_sub_folds:
+                    raise ValueError(
+                        f"Duplicate fold index {fold_idx} for subject {sub_id!r} in {split_path}"
+                    )
+                seen_sub_folds.add(fold_idx)
+                tr_local = tuple(int(i) - sub_offset for i in entry["train_idx"])
+                va_local = tuple(int(i) - sub_offset for i in entry["val_idx"])
+                te_local = tuple(int(i) - sub_offset for i in entry["test_idx"])
+                within_folds.append(
+                    WithinFoldSplit(
+                        protocol="within",
+                        subject_id=str(sub_id),
+                        fold=fold_idx,
+                        train_local_idx=tr_local,
+                        val_local_idx=va_local,
+                        test_local_idx=te_local,
+                        subject_n_trials=sub_n_trials,
+                    )
+                )
+
+        within_sorted = tuple(
+            sorted(within_folds, key=lambda f: (_natural_sort_key(f.subject_id), f.fold))
+        )
+        meta = {
+            "split_path": str(split_path),
+            "schema_version": raw.get("schema_version"),
+            "seed": raw.get("seed"),
+            "n_subjects": raw.get("n_subjects", len(subject_order)),
+            "subjects": list(subject_order),
+            "trial_uid_sha256": raw.get("trial_uid_sha256"),
+            "n_folds": len(within_sorted),
+            "n_folds_per_subject": len(raw[json_key][subject_order[0]]),
+        }
+        return within_sorted, meta
+
     if json_key not in raw or not isinstance(raw[json_key], list) or not raw[json_key]:
         raise ValueError(f"Split file {split_path} is missing non-empty fold list '{json_key}'")
 
@@ -333,12 +501,66 @@ def resolve_subject_fold_indices(
     return train_idx, val_idx, test_idx
 
 
+def resolve_within_fold_indices(
+    split: WithinFoldSplit,
+    subject_ids: np.ndarray,
+    trial_uids: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map a subject's within-subject local indices to verified disjoint global row indices."""
+    subs = np.asarray(subject_ids, dtype=str)
+    uids = np.asarray(trial_uids, dtype=str)
+    if len(subs) != len(uids):
+        raise ValueError("subject_ids and trial_uids must have equal length")
+
+    sub_rows = np.flatnonzero(subs == split.subject_id)
+    if sub_rows.size == 0:
+        raise ValueError(
+            f"Within-subject split {split.fold_key} references subject absent from features: "
+            f"{split.subject_id!r}"
+        )
+    if sub_rows.size != split.subject_n_trials:
+        raise ValueError(
+            f"Trial count mismatch for {split.subject_id!r} in {split.fold_key}: "
+            f"features have {sub_rows.size} trials, split expects {split.subject_n_trials}"
+        )
+
+    train_idx = sub_rows[np.asarray(split.train_local_idx, dtype=np.int64)]
+    val_idx = sub_rows[np.asarray(split.val_local_idx, dtype=np.int64)]
+    test_idx = sub_rows[np.asarray(split.test_local_idx, dtype=np.int64)]
+
+    if (
+        np.intersect1d(train_idx, val_idx).size
+        or np.intersect1d(train_idx, test_idx).size
+        or np.intersect1d(val_idx, test_idx).size
+    ):
+        raise ValueError(f"Trial index leakage detected in {split.fold_key}")
+
+    u_tr = set(uids[train_idx].tolist())
+    u_va = set(uids[val_idx].tolist())
+    u_te = set(uids[test_idx].tolist())
+    if (u_tr & u_va) or (u_tr & u_te) or (u_va & u_te):
+        raise ValueError(f"trial_uid leakage detected in {split.fold_key}")
+
+    return train_idx, val_idx, test_idx
+
+
+def resolve_fold_indices(
+    split: FoldSplit,
+    subject_ids: np.ndarray,
+    trial_uids: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dispatch fold index resolution for CS5, LOSO, or Within-Subject splits."""
+    if isinstance(split, WithinFoldSplit):
+        return resolve_within_fold_indices(split, subject_ids, trial_uids)
+    return resolve_subject_fold_indices(split, subject_ids, trial_uids)
+
+
 def compute_fold_config_hash(
     *,
     protocol: ProtocolName,
     scenario: FeatureScenarioSpec,
     model_config: ML3XGBoostConfig,
-    split: SubjectFoldSplit,
+    split: FoldSplit,
     threshold_metric: str = "balanced_accuracy",
 ) -> str:
     payload = {
@@ -526,14 +748,14 @@ def _validate_and_load_fold_checkpoint(
 def train_or_load_fold(
     *,
     scenario_matrix: ScenarioMatrix,
-    split: SubjectFoldSplit,
+    split: FoldSplit,
     model_config: ML3XGBoostConfig,
     fold_dir: Path,
     threshold_metric: str = "balanced_accuracy",
     resume: bool = False,
     overwrite: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray], str]:
-    """Train a single CS5 or LOSO fold or reuse its verified checkpoint."""
+    """Train a single CS5, LOSO, or Within-Subject fold or reuse its verified checkpoint."""
     expected_hash = compute_fold_config_hash(
         protocol=split.protocol,
         scenario=scenario_matrix.scenario,
@@ -552,7 +774,7 @@ def train_or_load_fold(
         fold_metrics, preds = cached
         return fold_metrics, preds, "reused"
 
-    train_idx, val_idx, test_idx = resolve_subject_fold_indices(
+    train_idx, val_idx, test_idx = resolve_fold_indices(
         split,
         scenario_matrix.subject_ids,
         scenario_matrix.trial_uids,
@@ -605,11 +827,17 @@ def train_or_load_fold(
     assert model.best_iteration_ is not None
     assert model.scale_pos_weight_ is not None
 
+    split_subject_id: Optional[str] = (
+        split.subject_id if isinstance(split, WithinFoldSplit) else None
+    )
+
     fold_metrics: Dict[str, Any] = {
         "schema_version": 1,
         "protocol": split.protocol,
         "experiment": scenario_matrix.scenario.name,
         "fold": int(split.fold),
+        "fold_key": split.fold_key,
+        **({"subject_id": split_subject_id} if split_subject_id is not None else {}),
         "config_hash": expected_hash,
         "n_features": int(scenario_matrix.n_features),
         "train_subjects": list(split.train_subjects),
@@ -666,6 +894,8 @@ def train_or_load_fold(
             fold_dir / "learning_curve.json",
             {
                 "fold": int(split.fold),
+                "fold_key": split.fold_key,
+                **({"subject_id": split_subject_id} if split_subject_id is not None else {}),
                 "best_iteration": int(model.best_iteration_),
                 **model.learning_curve_,
             },
@@ -676,6 +906,8 @@ def train_or_load_fold(
         "protocol": split.protocol,
         "experiment": scenario_matrix.scenario.name,
         "fold": int(split.fold),
+        "fold_key": split.fold_key,
+        **({"subject_id": split_subject_id} if split_subject_id is not None else {}),
         "config_hash": expected_hash,
         "feature_policy": scenario_matrix.scenario.policy_dict(),
         "model_config": model_config.report_dict(),
@@ -709,7 +941,10 @@ def aggregate_experiment_results(
 
     ordered_pairs = sorted(
         zip(fold_metrics_list, fold_preds_list),
-        key=lambda pair: int(pair[0]["fold"]),
+        key=lambda pair: (
+            _natural_sort_key(str(pair[0].get("subject_id") or "")),
+            int(pair[0]["fold"]),
+        ),
     )
     folds_sorted = [dict(p[0]) for p in ordered_pairs]
     preds_sorted = [p[1] for p in ordered_pairs]
@@ -760,7 +995,16 @@ def aggregate_experiment_results(
             per_subject_test[sub_id] = {
                 "subject_id": sub_id,
                 "fold": [e["fold"] for e in entries],
+                "n_folds": len(entries),
                 **{m: agg_sub[m]["mean"] for m in ALL_REPORTED_METRICS},
+                **{f"{m}_std": agg_sub[m]["std"] for m in ALL_REPORTED_METRICS},
+                "n_samples": int(sum(int(e.get("n_samples", 0)) for e in entries)),
+                "n_pos": int(sum(int(e.get("n_pos", 0)) for e in entries)),
+                "n_neg": int(sum(int(e.get("n_neg", 0)) for e in entries)),
+                "tp": int(sum(int(e.get("tp", 0)) for e in entries)),
+                "tn": int(sum(int(e.get("tn", 0)) for e in entries)),
+                "fp": int(sum(int(e.get("fp", 0)) for e in entries)),
+                "fn": int(sum(int(e.get("fn", 0)) for e in entries)),
             }
 
     test_subject_macro_summary = summarize_metric_records(list(per_subject_test.values()))
@@ -826,6 +1070,7 @@ def aggregate_experiment_results(
             {
                 "protocol": protocol,
                 "experiment": experiment,
+                **({"subject_id": f["subject_id"]} if "subject_id" in f else {}),
                 "fold": int(f["fold"]),
                 "test_subjects": ",".join(f["test_subjects"]),
                 "n_features": int(f["n_features"]),
@@ -863,12 +1108,23 @@ def aggregate_experiment_results(
                 "experiment": experiment,
                 "subject_id": sub_id,
                 "fold": s_rec.get("fold"),
+                **({"n_folds": s_rec["n_folds"]} if "n_folds" in s_rec else {}),
                 "pr_auc": s_rec.get("pr_auc"),
                 "roc_auc": s_rec.get("roc_auc"),
                 "balanced_accuracy": s_rec.get("balanced_accuracy"),
                 "f1_target": s_rec.get("f1_target"),
                 "sensitivity": s_rec.get("sensitivity"),
                 "specificity": s_rec.get("specificity"),
+                **(
+                    {
+                        "pr_auc_std": s_rec.get("pr_auc_std"),
+                        "roc_auc_std": s_rec.get("roc_auc_std"),
+                        "balanced_accuracy_std": s_rec.get("balanced_accuracy_std"),
+                        "f1_target_std": s_rec.get("f1_target_std"),
+                    }
+                    if "pr_auc_std" in s_rec
+                    else {}
+                ),
                 "n_samples": s_rec.get("n_samples"),
                 "n_pos": s_rec.get("n_pos"),
                 "n_neg": s_rec.get("n_neg"),
@@ -940,9 +1196,18 @@ def _compute_paired_subject_deltas(
         subject_deltas[metric] = summarize_scalar_values(diffs)
         per_sub_vectors[metric] = diffs
 
-    folds_a = {int(f["fold"]): f for f in summaries[exp_a].get("per_fold", [])}
-    folds_b = {int(f["fold"]): f for f in summaries[exp_b].get("per_fold", [])}
-    shared_folds = sorted(set(folds_a) & set(folds_b))
+    folds_a = {
+        (str(f.get("subject_id") or ""), int(f["fold"])): f
+        for f in summaries[exp_a].get("per_fold", [])
+    }
+    folds_b = {
+        (str(f.get("subject_id") or ""), int(f["fold"])): f
+        for f in summaries[exp_b].get("per_fold", [])
+    }
+    shared_folds = sorted(
+        set(folds_a) & set(folds_b),
+        key=lambda k: (_natural_sort_key(k[0]), k[1]),
+    )
     fold_deltas: Dict[str, Dict[str, Any]] = {}
     per_fold_vectors: Dict[str, List[float]] = {}
     for metric in ALL_REPORTED_METRICS:
@@ -1045,6 +1310,8 @@ def write_protocol_comparison_and_plots(
     generated_plots: List[str] = []
     if protocol == "cs5":
         generated_plots.extend(_generate_cs5_plots(protocol_dir, summaries, paired_with_vectors))
+    elif protocol == "within":
+        generated_plots.extend(_generate_within_plots(protocol_dir, summaries, paired_with_vectors))
     else:
         generated_plots.extend(_generate_loso_plots(protocol_dir, summaries, paired_with_vectors))
     generated_plots.extend(
@@ -1723,6 +1990,191 @@ def _generate_loso_plots(
     return saved_files
 
 
+def _generate_within_plots(
+    protocol_dir: Path,
+    summaries: Mapping[str, Mapping[str, Any]],
+    paired_deltas: Mapping[str, Mapping[str, Any]],
+) -> List[str]:
+    del paired_deltas  # reserved for multi-experiment within-subject comparisons
+    setup_publication_style()
+    exp_names = list(summaries.keys())
+    x = np.arange(len(exp_names))
+    colors = [_exp_color(e) for e in exp_names]
+    labels = [_exp_label(e) for e in exp_names]
+    rng = np.random.default_rng(42)
+    saved_files: List[str] = []
+
+    n_subs = max(int(summaries[e]["n_test_subjects"]) for e in exp_names)
+
+    # 1. within_metric_distribution.png
+    fig, axes = plt.subplots(2, 2, figsize=(13.6, 9.2), constrained_layout=True)
+    fig.suptitle(
+        f"ML3 Within-Subject 5-Fold (N = {n_subs} Subjects) — Metric Distributions & Train Time"
+    )
+    for ax, metric, title in (
+        (axes[0, 0], "pr_auc", "(A) Within-Subject Per-Subject PR-AUC (5-Fold Mean)"),
+        (axes[0, 1], "roc_auc", "(B) Within-Subject Per-Subject ROC-AUC (5-Fold Mean)"),
+        (axes[1, 0], "balanced_accuracy", "(C) Within-Subject Balanced Accuracy (5-Fold Mean)"),
+    ):
+        series = []
+        for e in exp_names:
+            vals = [
+                float(s[metric])
+                for s in summaries[e]["per_subject"].values()
+                if s.get(metric) is not None and math.isfinite(float(s[metric]))
+            ]
+            series.append(vals if vals else [float("nan")])
+        bp = ax.boxplot(
+            series,
+            positions=x,
+            widths=0.42,
+            patch_artist=True,
+            showfliers=False,
+            medianprops=dict(color=OKABE_ITO["black"], lw=1.4),
+        )
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+            patch.set_edgecolor(OKABE_ITO["black"])
+            patch.set_alpha(0.60)
+        for idx, e in enumerate(exp_names):
+            vals = series[idx]
+            mean_v = summaries[e]["test"]["subject_macro"][metric]["mean"]
+            std_v = summaries[e]["test"]["subject_macro"][metric]["std"]
+            jitter = rng.uniform(-0.12, 0.12, size=len(vals))
+            ax.scatter(
+                np.full(len(vals), idx) + jitter,
+                vals,
+                color=OKABE_ITO["black"],
+                s=18,
+                alpha=0.55,
+                zorder=4,
+            )
+            ax.errorbar(
+                [idx],
+                [mean_v],
+                yerr=[std_v if math.isfinite(std_v) else 0.0],
+                fmt="D",
+                color=OKABE_ITO["yellow"],
+                markeredgecolor=OKABE_ITO["black"],
+                ecolor=OKABE_ITO["black"],
+                capsize=4,
+                zorder=5,
+            )
+            if math.isfinite(mean_v):
+                sd_v = std_v if math.isfinite(std_v) else 0.0
+                ax.text(
+                    idx,
+                    min(1.04, max(vals) + 0.02),
+                    f"{mean_v:.3f}±{sd_v:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8.4,
+                    color=OKABE_ITO["black"],
+                )
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=12, ha="right")
+        ax.set_ylim(0.0, 1.09)
+        ax.set_title(title)
+        ax.grid(axis="y")
+
+    ax_cost = axes[1, 1]
+    feat_counts = [summaries[e]["n_features"] for e in exp_names]
+    time_means = [summaries[e]["train_duration_sec"]["mean"] for e in exp_names]
+    time_stds = [summaries[e]["train_duration_sec"]["std"] for e in exp_names]
+    b_feat = ax_cost.bar(
+        x - 0.18,
+        feat_counts,
+        width=0.34,
+        color=OKABE_ITO["blue"],
+        alpha=0.85,
+        edgecolor=OKABE_ITO["black"],
+        linewidth=0.6,
+    )
+    ax_cost.set_ylabel("Feature Count", color=OKABE_ITO["blue"])
+    ax_cost.tick_params(axis="y", labelcolor=OKABE_ITO["blue"])
+    for idx, val in enumerate(feat_counts):
+        ax_cost.text(
+            b_feat[idx].get_x() + b_feat[idx].get_width() / 2.0,
+            val * 1.01,
+            f"{val:,}",
+            ha="center",
+            va="bottom",
+            fontsize=8.0,
+        )
+    ax_time = ax_cost.twinx()
+    ax_time.spines["top"].set_visible(False)
+    ax_time.bar(
+        x + 0.18,
+        time_means,
+        width=0.34,
+        yerr=time_stds,
+        capsize=3.5,
+        color=OKABE_ITO["orange"],
+        alpha=0.85,
+        edgecolor=OKABE_ITO["black"],
+        linewidth=0.6,
+    )
+    ax_time.set_ylabel("Per-Fold Train Time (s, Mean ± SD)", color=OKABE_ITO["orange"])
+    ax_time.tick_params(axis="y", labelcolor=OKABE_ITO["orange"])
+    ax_cost.set_xticks(x)
+    ax_cost.set_xticklabels(labels, rotation=12, ha="right")
+    ax_cost.set_title("(D) Feature Count & Single-Fold Train Time")
+    ax_cost.grid(axis="y")
+    saved_files.append(_save_pub_png(fig, protocol_dir / "within_metric_distribution.png"))
+
+    # 2. within_per_subject_metrics.png
+    all_subjects = sorted(
+        {sub for e in exp_names for sub in summaries[e]["per_subject"].keys()},
+        key=_natural_sort_key,
+    )
+    sx = np.arange(len(all_subjects))
+    fig, axes = plt.subplots(2, 1, figsize=(15.5, 8.6), constrained_layout=True, sharex=True)
+    fig.suptitle(
+        f"ML3 Within-Subject 5-Fold — Per-Subject Profile (Mean ± SD Across 5 Folds, N = {len(all_subjects)})"
+    )
+    for ax, metric, title in (
+        (axes[0], "pr_auc", "(A) Within-Subject Per-Subject PR-AUC (5-Fold Mean ± SD)"),
+        (axes[1], "roc_auc", "(B) Within-Subject Per-Subject ROC-AUC (5-Fold Mean ± SD)"),
+    ):
+        for e in exp_names:
+            sub_map = summaries[e]["per_subject"]
+            y_vals = [
+                float(sub_map[s][metric]) if s in sub_map and sub_map[s].get(metric) is not None else float("nan")
+                for s in all_subjects
+            ]
+            y_errs = [
+                float(sub_map[s].get(f"{metric}_std", 0.0))
+                if s in sub_map and sub_map[s].get(f"{metric}_std") is not None and math.isfinite(float(sub_map[s].get(f"{metric}_std", 0.0)))
+                else 0.0
+                for s in all_subjects
+            ]
+            col = _exp_color(e)
+            macro_mean = summaries[e]["test"]["subject_macro"][metric]["mean"]
+            ax.errorbar(
+                sx,
+                y_vals,
+                yerr=y_errs,
+                marker=_exp_marker(e),
+                markersize=4.8,
+                linewidth=1.5,
+                capsize=2.5,
+                color=col,
+                label=f"{_exp_label(e)} (Cohort Mean={macro_mean:.3f})",
+                alpha=0.92,
+            )
+            if math.isfinite(macro_mean):
+                ax.axhline(macro_mean, color=col, ls="--", lw=1.0, alpha=0.65)
+        ax.set_ylabel(metric.upper())
+        ax.set_ylim(0.0, 1.04)
+        ax.set_title(title)
+        ax.grid(True)
+        ax.legend(loc="lower right", ncol=max(1, len(exp_names)), frameon=False)
+    axes[1].set_xticks(sx)
+    axes[1].set_xticklabels(all_subjects, rotation=55, ha="right", fontsize=8.0)
+    saved_files.append(_save_pub_png(fig, protocol_dir / "within_per_subject_metrics.png"))
+    return saved_files
+
+
 def backfill_learning_curves_from_checkpoints(
     *,
     protocol_dir: Path | str,
@@ -1747,7 +2199,7 @@ def backfill_learning_curves_from_checkpoints(
     missing_exps: list[str] = []
     for exp_name in summaries:
         exp_dir = p_dir / exp_name
-        for fold_dir in sorted(exp_dir.glob("fold_*")):
+        for fold_dir in _iter_fold_checkpoint_dirs(exp_dir):
             if not (fold_dir / "model.json").is_file():
                 continue
             lc_ok = (fold_dir / "learning_curve.json").is_file()
@@ -1761,7 +2213,7 @@ def backfill_learning_curves_from_checkpoints(
         return 0
 
     all_folds, _ = load_ml3_splits(splits_dir, norm_proto)
-    fold_by_idx = {f.fold: f for f in all_folds}
+    fold_by_key = {f.fold_key: f for f in all_folds}
     req_groups = required_feature_groups_for_experiments(missing_exps)
     needs_gamma = any(FEATURE_SCENARIO_SPECS[e].uses_gamma for e in missing_exps)
     dataset = load_ml3_feature_dataset(
@@ -1787,7 +2239,7 @@ def backfill_learning_curves_from_checkpoints(
         full_dm = xgb.DMatrix(scenario_matrix.values)
         exp_updated = 0
 
-        for fold_dir in sorted(exp_dir.glob("fold_*")):
+        for fold_dir in _iter_fold_checkpoint_dirs(exp_dir):
             m_path = fold_dir / "metrics.json"
             p_path = fold_dir / "predictions.npz"
             mod_path = fold_dir / "model.json"
@@ -1801,8 +2253,9 @@ def backfill_learning_curves_from_checkpoints(
 
             if need_train or need_lc:
                 fold_idx = int(f_metrics["fold"])
-                split = fold_by_idx[fold_idx]
-                train_idx, val_idx, _ = resolve_subject_fold_indices(
+                f_key = str(f_metrics.get("fold_key") or fold_dir.name)
+                split = fold_by_key[f_key]
+                train_idx, val_idx, _ = resolve_fold_indices(
                     split, scenario_matrix.subject_ids, scenario_matrix.trial_uids
                 )
                 y_tr = scenario_matrix.targets[train_idx]
@@ -1913,8 +2366,10 @@ def generate_ml3_diagnostic_plots(
     curves_by_exp: Dict[str, List[Dict[str, Any]]] = {}
     for e in exp_names:
         f_curves = []
-        for lc_file in sorted((p_dir / e).glob("fold_*/learning_curve.json")):
-            f_curves.append(json.loads(lc_file.read_text(encoding="utf-8")))
+        for fold_dir in _iter_fold_checkpoint_dirs(p_dir / e):
+            lc_file = fold_dir / "learning_curve.json"
+            if lc_file.is_file():
+                f_curves.append(json.loads(lc_file.read_text(encoding="utf-8")))
         if f_curves:
             curves_by_exp[e] = f_curves
 
@@ -2144,7 +2599,11 @@ def generate_ml3_diagnostic_plots(
     )
     if imp_target is not None:
         feat_names = _reconstruct_scenario_feature_names(p_dir, imp_target, features_dir=features_dir)
-        model_files = sorted((p_dir / imp_target).glob("fold_*/model.json"))
+        model_files = [
+            fd / "model.json"
+            for fd in _iter_fold_checkpoint_dirs(p_dir / imp_target)
+            if (fd / "model.json").is_file()
+        ]
         if feat_names and model_files:
             n_feat = len(feat_names)
             fold_gains = []
@@ -2334,6 +2793,46 @@ def _reconstruct_scenario_feature_names(
 
 # ── High-Level Planning & Execution Orchestrator ─────────────────────────────
 
+def _filter_ml3_splits(
+    all_folds: Tuple[FoldSplit, ...],
+    protocol: ProtocolName,
+    *,
+    folds_filter: Optional[Sequence[int]] = None,
+    subjects_filter: Optional[Sequence[str]] = None,
+) -> Tuple[FoldSplit, ...]:
+    selected = all_folds
+    if subjects_filter is not None:
+        wanted_subs = {str(s).strip() for s in subjects_filter if str(s).strip()}
+        if protocol == "within":
+            available_subs = {f.subject_id for f in all_folds if isinstance(f, WithinFoldSplit)}
+            missing_subs = sorted(wanted_subs - available_subs, key=_natural_sort_key)
+            if missing_subs:
+                raise ValueError(
+                    f"Requested subjects not present in {protocol}: {missing_subs}"
+                )
+            selected = tuple(
+                f for f in selected if isinstance(f, WithinFoldSplit) and f.subject_id in wanted_subs
+            )
+        else:
+            selected = tuple(
+                f for f in selected if any(s in wanted_subs for s in f.test_subjects)
+            )
+            if not selected:
+                raise ValueError(
+                    f"No {protocol} folds matched requested subjects: {sorted(wanted_subs)}"
+                )
+
+    if folds_filter is not None:
+        wanted = set(int(f) for f in folds_filter)
+        available = {f.fold for f in selected}
+        missing = sorted(wanted - available)
+        if missing:
+            raise ValueError(f"Requested fold indices not present in {protocol}: {missing}")
+        selected = tuple(f for f in selected if f.fold in wanted)
+
+    return selected
+
+
 def build_ml3_execution_plan(
     *,
     features_dir: Path | str,
@@ -2343,6 +2842,7 @@ def build_ml3_execution_plan(
     output_dir: Path | str,
     model_config: ML3XGBoostConfig = ML3XGBoostConfig(),
     folds_filter: Optional[Sequence[int]] = None,
+    subjects_filter: Optional[Sequence[str]] = None,
     threshold_metric: str = "balanced_accuracy",
     allow_gamma_loso: bool = False,
     mount_drive: bool = False,
@@ -2355,16 +2855,12 @@ def build_ml3_execution_plan(
     )
     req_groups = required_feature_groups_for_experiments(chosen_experiments)
     all_folds, split_meta = load_ml3_splits(splits_dir, norm_protocol)
-
-    if folds_filter is not None:
-        wanted = set(int(f) for f in folds_filter)
-        available = {f.fold for f in all_folds}
-        missing = sorted(wanted - available)
-        if missing:
-            raise ValueError(f"Requested fold indices not present in {norm_protocol}: {missing}")
-        selected_folds = tuple(f for f in all_folds if f.fold in wanted)
-    else:
-        selected_folds = all_folds
+    selected_folds = _filter_ml3_splits(
+        all_folds,
+        norm_protocol,
+        folds_filter=folds_filter,
+        subjects_filter=subjects_filter,
+    )
 
     store_info = inspect_feature_store_metadata(
         features_dir,
@@ -2414,7 +2910,11 @@ def build_ml3_execution_plan(
         "n_channels": n_ch,
         "split_metadata": split_meta,
         "n_folds_selected": len(selected_folds),
-        "fold_indices": [f.fold for f in selected_folds],
+        "fold_indices": (
+            [f.fold_key for f in selected_folds]
+            if norm_protocol == "within"
+            else [f.fold for f in selected_folds]
+        ),
         "threshold_metric": threshold_metric,
         "model_config": model_config.report_dict(),
         "experiments": scenario_details,
@@ -2430,6 +2930,7 @@ def run_ml3_experiments(
     output_dir: Path | str,
     model_config: ML3XGBoostConfig = ML3XGBoostConfig(),
     folds_filter: Optional[Sequence[int]] = None,
+    subjects_filter: Optional[Sequence[str]] = None,
     threshold_metric: str = "balanced_accuracy",
     resume: bool = False,
     overwrite: bool = False,
@@ -2438,7 +2939,7 @@ def run_ml3_experiments(
     drive_mount_point: Path | str = "/content/drive",
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Execute requested ML3 feature scenarios across CS5 or LOSO folds."""
+    """Execute requested ML3 feature scenarios across CS5, LOSO, or Within-Subject folds."""
     norm_protocol = normalize_protocol_name(protocol)
     chosen_experiments = validate_experiment_list(
         norm_protocol, experiments, allow_gamma_loso=allow_gamma_loso
@@ -2447,15 +2948,12 @@ def run_ml3_experiments(
     needs_gamma = any(FEATURE_SCENARIO_SPECS[e].uses_gamma for e in chosen_experiments)
 
     all_folds, split_meta = load_ml3_splits(splits_dir, norm_protocol)
-    if folds_filter is not None:
-        wanted = set(int(f) for f in folds_filter)
-        available = {f.fold for f in all_folds}
-        missing = sorted(wanted - available)
-        if missing:
-            raise ValueError(f"Requested fold indices not present in {norm_protocol}: {missing}")
-        selected_folds = tuple(f for f in all_folds if f.fold in wanted)
-    else:
-        selected_folds = all_folds
+    selected_folds = _filter_ml3_splits(
+        all_folds,
+        norm_protocol,
+        folds_filter=folds_filter,
+        subjects_filter=subjects_filter,
+    )
 
     needed_subjects = sorted(
         {
@@ -2502,7 +3000,7 @@ def run_ml3_experiments(
         reused_count = 0
 
         for split in selected_folds:
-            fold_dir = exp_dir / f"fold_{split.fold:02d}"
+            fold_dir = exp_dir / split.fold_key
             f_metrics, f_preds, status = train_or_load_fold(
                 scenario_matrix=scenario_matrix,
                 split=split,
@@ -2522,7 +3020,7 @@ def run_ml3_experiments(
             if verbose:
                 tp = f_metrics["test_pooled"]
                 print(
-                    f"  fold={split.fold:02d} [{status}] "
+                    f"  {split.fold_key} [{status}] "
                     f"best_iter={f_metrics['best_iteration']} "
                     f"thr={f_metrics['threshold']:.3f} "
                     f"PR-AUC={tp['pr_auc']:.4f} "

@@ -1,4 +1,4 @@
-"""CLI entrypoint for ML3 P300 XGBoost experiments (CS5 & LOSO) with `/content` SSD staging.
+"""CLI entrypoint for ML3 P300 XGBoost experiments (CS5, LOSO & Within-Subject) with `/content` SSD staging.
 
 Colab / VS Code Colab Extension fast workflow (stages features from Drive -> `/content/features`,
 saves checkpoints & plots back to Google Drive)::
@@ -21,6 +21,18 @@ LOSO evaluation::
       --splits-dir splits \
       --protocol loso \
       --experiments temporal combined_w5 combined_w8 \
+      --output-dir /content/drive/MyDrive/EEG-mini-project/results/ml3 \
+      --device cuda \
+      --resume
+
+Within-Subject 5-Fold evaluation (default: `combined_w5`)::
+
+    python scripts/training/ML3/train_ml3.py \
+      --features-dir /content/drive/MyDrive/EEG-mini-project/features \
+      --stage-to-local --local-features-dir /content/features \
+      --splits-dir splits \
+      --protocol within \
+      --experiments combined_w5 \
       --output-dir /content/drive/MyDrive/EEG-mini-project/results/ml3 \
       --device cuda \
       --resume
@@ -119,13 +131,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--splits-dir",
         type=Path,
         default=Path("splits"),
-        help="Directory containing cross_5fold.json and loso.json (default: splits).",
+        help="Directory containing cross_5fold.json, loso.json, and within_5fold.json (default: splits).",
     )
     parser.add_argument(
         "--protocol",
-        choices=("cs5", "loso"),
+        choices=("cs5", "loso", "within"),
         required=True,
-        help="Evaluation protocol: 'cs5' (Cross-Subject 5-Fold) or 'loso'.",
+        help="Evaluation protocol: 'cs5' (Cross-Subject 5-Fold), 'loso', or 'within' (Within-Subject 5-Fold).",
     )
     parser.add_argument(
         "--experiments",
@@ -133,8 +145,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=CANONICAL_EXPERIMENT_ORDER,
         default=None,
         help=(
-            "Feature scenarios to run. Defaults to all 5 main scenarios for cs5 "
-            "and (temporal, combined_w5, combined_w8) for loso."
+            "Feature scenarios to run. Defaults to all 5 main scenarios for cs5, "
+            "(temporal, combined_w5, combined_w8) for loso, and (combined_w5,) for within."
         ),
     )
     parser.add_argument(
@@ -164,6 +176,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional subset of fold indices to execute.",
+    )
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        type=str,
+        default=None,
+        help="Optional subset of subject IDs to execute (useful for within-subject runs).",
     )
     parser.add_argument(
         "--plan-only",
@@ -265,6 +284,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             model_config=model_config,
             folds_filter=args.folds,
+            subjects_filter=args.subjects,
             threshold_metric=args.threshold_metric,
             allow_gamma_loso=args.allow_gamma_loso,
             mount_drive=args.mount_drive,
@@ -287,6 +307,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir=args.output_dir,
         model_config=model_config,
         folds_filter=args.folds,
+        subjects_filter=args.subjects,
         threshold_metric=args.threshold_metric,
         resume=args.resume,
         overwrite=args.overwrite,
