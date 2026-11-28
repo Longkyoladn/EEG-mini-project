@@ -181,6 +181,7 @@ class ML3XGBoostModel:
         self.scale_pos_weight_: Optional[float] = None
         self.best_iteration_: Optional[int] = None
         self.best_val_score_: Optional[float] = None
+        self.learning_curve_: Optional[Dict[str, list[float | int]]] = None
         self.estimator_: Optional[Any] = None
 
     def _build_callbacks(self) -> Optional[list[Any]]:
@@ -242,11 +243,13 @@ class ML3XGBoostModel:
         if callbacks is not None:
             clf_kwargs["callbacks"] = callbacks
 
+        # XGBoost monitors the LAST entry in eval_set (validation_1 = X_va) for
+        # early stopping while logging per-round train/val aucpr curves.
         clf = xgb.XGBClassifier(**clf_kwargs)
         clf.fit(
             X_tr,
             y_tr,
-            eval_set=[(X_va, y_va)],
+            eval_set=[(X_tr, y_tr), (X_va, y_va)],
             verbose=False,
         )
 
@@ -255,11 +258,34 @@ class ML3XGBoostModel:
             best_iter = clf.get_booster().num_boosted_rounds() - 1
         best_score = getattr(clf, "best_score", None)
 
+        evals_res = clf.evals_result() or {}
+        metric_key = self.config.eval_metric
+        tr_hist = [float(v) for v in evals_res.get("validation_0", {}).get(metric_key, [])]
+        va_hist = [float(v) for v in evals_res.get("validation_1", {}).get(metric_key, [])]
+
         self.estimator_ = clf
         self.scale_pos_weight_ = spw
         self.best_iteration_ = int(best_iter)
         self.best_val_score_ = float(best_score) if best_score is not None else None
+        self.learning_curve_ = {
+            "rounds": list(range(1, len(va_hist) + 1)),
+            "train_aucpr": tr_hist,
+            "val_aucpr": va_hist,
+        }
         return self
+
+    def gain_importance_vector(self, n_features: int) -> np.ndarray:
+        """Extract total/mean gain importance aligned to column indices ``0 .. n_features-1``."""
+        if self.estimator_ is None:
+            raise RuntimeError("ML3XGBoostModel has not been fitted or loaded")
+        raw_scores = self.estimator_.get_booster().get_score(importance_type="gain")
+        vec = np.zeros(int(n_features), dtype=np.float64)
+        for key, val in raw_scores.items():
+            if key.startswith("f") and key[1:].isdigit():
+                idx = int(key[1:])
+                if 0 <= idx < n_features:
+                    vec[idx] = float(val)
+        return vec
 
     def predict_proba_positive(self, X: np.ndarray) -> np.ndarray:
         """Predict P(Target=1) using only trees up to ``best_iteration + 1``."""

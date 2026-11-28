@@ -18,6 +18,47 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_curve
+
+try:
+    from src.evaluation.visualization import OKABE_ITO, setup_publication_style
+except Exception:  # Fallback identical to src.evaluation.visualization when MNE is absent on Colab
+    OKABE_ITO: Dict[str, str] = {
+        "blue": "#0072B2",
+        "orange": "#D55E00",
+        "green": "#009E73",
+        "purple": "#CC79A7",
+        "sky": "#56B4E9",
+        "yellow": "#E69F00",
+        "black": "#1F2937",
+        "grey": "#6B7280",
+        "red": "#B91C1C",
+    }
+
+    def setup_publication_style() -> None:
+        plt.rcParams.update(
+            {
+                "font.family": "sans-serif",
+                "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica"],
+                "font.size": 9.5,
+                "axes.titlesize": 10.5,
+                "axes.titleweight": "bold",
+                "axes.labelsize": 9.5,
+                "xtick.labelsize": 8.5,
+                "ytick.labelsize": 8.5,
+                "legend.fontsize": 8.2,
+                "figure.titlesize": 12.0,
+                "figure.titleweight": "bold",
+                "axes.spines.top": False,
+                "axes.spines.right": False,
+                "axes.linewidth": 0.9,
+                "grid.alpha": 0.28,
+                "grid.linestyle": "--",
+                "savefig.dpi": 300,
+                "pdf.fonttype": 42,
+                "ps.fonttype": 42,
+            }
+        )
 
 from src.evaluation.metrics import (
     METRIC_NAMES,
@@ -32,9 +73,11 @@ from src.features.ml3_feature_store import (
     LOSO_MAIN_EXPERIMENTS,
     ML3FeatureDataset,
     ScenarioMatrix,
+    W8_WINDOW_NAMES,
     ensure_drive_path_ready,
     inspect_feature_store_metadata,
     load_ml3_feature_dataset,
+    parse_ml3_feature_name,
 )
 from src.models.Ml3 import ML3XGBoostConfig, ML3XGBoostModel
 
@@ -527,6 +570,7 @@ def train_or_load_fold(
     model.fit_fold(X_train, y_train, X_val, y_val)
     train_duration_sec = float(time.perf_counter() - t_start)
 
+    train_prob = model.predict_proba_positive(X_train)
     val_prob = model.predict_proba_positive(X_val)
     test_prob = model.predict_proba_positive(X_test)
 
@@ -539,6 +583,9 @@ def train_or_load_fold(
     val_subs = scenario_matrix.subject_ids[val_idx]
     test_subs = scenario_matrix.subject_ids[test_idx]
 
+    train_pooled = _format_metric_with_confusion(
+        compute_binary_metrics(y_train, train_prob, threshold=threshold)
+    )
     val_pooled = _format_metric_with_confusion(
         compute_binary_metrics(y_val, val_prob, threshold=threshold)
     )
@@ -580,6 +627,7 @@ def train_or_load_fold(
         "threshold_metric": threshold_metric,
         "threshold": float(threshold),
         "train_duration_sec": train_duration_sec,
+        "train_pooled": train_pooled,
         "validation_pooled": val_pooled,
         "validation_per_subject": val_per_subject,
         "validation_subject_macro": val_subject_macro,
@@ -613,6 +661,15 @@ def train_or_load_fold(
     tmp_preds.replace(fold_dir / "predictions.npz")
 
     _atomic_write_json(fold_dir / "metrics.json", fold_metrics)
+    if model.learning_curve_ is not None:
+        _atomic_write_json(
+            fold_dir / "learning_curve.json",
+            {
+                "fold": int(split.fold),
+                "best_iteration": int(model.best_iteration_),
+                **model.learning_curve_,
+            },
+        )
 
     manifest_payload: Dict[str, Any] = {
         "schema_version": 1,
@@ -678,6 +735,10 @@ def aggregate_experiment_results(
     )
     val_fold_pooled_summary = summarize_metric_records(
         [f["validation_pooled"] for f in folds_sorted]
+    )
+    train_records = [f["train_pooled"] for f in folds_sorted if "train_pooled" in f]
+    train_fold_pooled_summary = (
+        summarize_metric_records(train_records) if train_records else None
     )
 
     # 2. Subject-macro aggregation (equal weight per subject; primary cross-subject metric)
@@ -745,6 +806,11 @@ def aggregate_experiment_results(
             "fold_pooled": val_fold_pooled_summary,
             "overall_trial_pooled": overall_val_pooled,
         },
+        "train": (
+            {"fold_pooled": train_fold_pooled_summary}
+            if train_fold_pooled_summary is not None
+            else {}
+        ),
         "per_subject": per_subject_test,
         "per_fold": folds_sorted,
     }
@@ -905,6 +971,8 @@ def _compute_paired_subject_deltas(
 def write_protocol_comparison_and_plots(
     protocol: ProtocolName,
     protocol_dir: Path,
+    *,
+    features_dir: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """Build protocol comparison tables and generate CS5/LOSO plots without auto-picking a winner."""
     summaries = _discover_completed_experiment_summaries(protocol_dir)
@@ -979,6 +1047,14 @@ def write_protocol_comparison_and_plots(
         generated_plots.extend(_generate_cs5_plots(protocol_dir, summaries, paired_with_vectors))
     else:
         generated_plots.extend(_generate_loso_plots(protocol_dir, summaries, paired_with_vectors))
+    generated_plots.extend(
+        generate_ml3_diagnostic_plots(
+            protocol=protocol,
+            protocol_dir=protocol_dir,
+            summaries=summaries,
+            features_dir=features_dir,
+        )
+    )
 
     comparison_payload = {
         "schema_version": 1,
@@ -996,18 +1072,28 @@ def write_protocol_comparison_and_plots(
     return comparison_payload
 
 
-# ── Visualization Helpers (CS5 & LOSO) ───────────────────────────────────────
+# ── Publication Visualization Suite (setup_publication_style + OKABE_ITO) ────
 
 _EXP_COLORS: Dict[str, str] = {
-    "temporal": "#1f77b4",
-    "wavelet_w5": "#ff7f0e",
-    "wavelet_w8": "#d62728",
-    "combined_w5": "#2ca02c",
-    "combined_w8": "#9467bd",
-    "combined_w5_gamma": "#17becf",
-    "combined_w8_gamma": "#e377c2",
-    "wavelet_w5_gamma": "#bcbd22",
-    "wavelet_w8_gamma": "#8c564b",
+    "temporal": OKABE_ITO["blue"],
+    "wavelet_w5": OKABE_ITO["yellow"],
+    "wavelet_w8": OKABE_ITO["orange"],
+    "combined_w5": OKABE_ITO["green"],
+    "combined_w8": OKABE_ITO["purple"],
+    "combined_w5_gamma": OKABE_ITO["sky"],
+    "combined_w8_gamma": OKABE_ITO["red"],
+    "wavelet_w5_gamma": OKABE_ITO["sky"],
+    "wavelet_w8_gamma": OKABE_ITO["red"],
+}
+
+_EXP_MARKERS: Dict[str, str] = {
+    "temporal": "o",
+    "wavelet_w5": "s",
+    "wavelet_w8": "^",
+    "combined_w5": "D",
+    "combined_w8": "P",
+    "combined_w5_gamma": "v",
+    "combined_w8_gamma": "X",
 }
 
 _EXP_LABELS: Dict[str, str] = {
@@ -1022,13 +1108,35 @@ _EXP_LABELS: Dict[str, str] = {
     "wavelet_w8_gamma": "Wavelet W8+Gamma",
 }
 
+_WINDOW_DISPLAY: Dict[str, str] = {
+    "baseline_m200_0": "[-200, 0]",
+    "post_0_200": "[0, 200]",
+    "post_100_300": "[100, 300]",
+    "post_200_400": "[200, 400]",
+    "post_300_500": "[300, 500]",
+    "post_400_600": "[400, 600]",
+    "post_500_700": "[500, 700]",
+    "post_600_800": "[600, 800]",
+}
+
 
 def _exp_color(name: str) -> str:
-    return _EXP_COLORS.get(name, "#4d4d4d")
+    return _EXP_COLORS.get(name, OKABE_ITO["grey"])
+
+
+def _exp_marker(name: str) -> str:
+    return _EXP_MARKERS.get(name, "o")
 
 
 def _exp_label(name: str) -> str:
     return _EXP_LABELS.get(name, name)
+
+
+def _save_pub_png(fig: plt.Figure, out_path: Path) -> str:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out_path.name
 
 
 def _generate_cs5_plots(
@@ -1036,6 +1144,7 @@ def _generate_cs5_plots(
     summaries: Mapping[str, Mapping[str, Any]],
     paired_deltas: Mapping[str, Mapping[str, Any]],
 ) -> List[str]:
+    setup_publication_style()
     exp_names = list(summaries.keys())
     x = np.arange(len(exp_names))
     colors = [_exp_color(e) for e in exp_names]
@@ -1043,159 +1152,257 @@ def _generate_cs5_plots(
     rng = np.random.default_rng(42)
     saved_files: List[str] = []
 
-    # 1. cs5_metric_comparison.png (Trial-pooled fold Mean ± SD, individual folds, feature count, train time)
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
-    fig.suptitle("ML3 Cross-Subject 5-Fold — Trial-Pooled Metrics, Feature Count & Train Time", fontsize=13, fontweight="bold")
+    # 1. cs5_metric_comparison.png
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 9.6), constrained_layout=True)
+    fig.suptitle("ML3 Cross-Subject 5-Fold — Trial-Pooled Metrics, Dimensionality & Train Time")
 
     for ax, metric, title in (
-        (axes[0, 0], "pr_auc", "Test Trial-Pooled PR-AUC (Mean ± SD + Fold Dots)"),
-        (axes[0, 1], "roc_auc", "Test Trial-Pooled ROC-AUC (Mean ± SD + Fold Dots)"),
+        (axes[0, 0], "pr_auc", "(A) Test Fold-Pooled PR-AUC (Mean ± SD)"),
+        (axes[0, 1], "roc_auc", "(B) Test Fold-Pooled ROC-AUC (Mean ± SD)"),
     ):
         means = [summaries[e]["test"]["fold_pooled"][metric]["mean"] for e in exp_names]
         stds = [summaries[e]["test"]["fold_pooled"][metric]["std"] for e in exp_names]
-        bars = ax.bar(x, means, yerr=stds, capsize=5, color=colors, alpha=0.82, edgecolor="black", linewidth=0.8)
+        bars = ax.bar(
+            x,
+            means,
+            width=0.58,
+            yerr=stds,
+            capsize=4,
+            color=colors,
+            alpha=0.84,
+            edgecolor=OKABE_ITO["black"],
+            linewidth=0.8,
+            error_kw=dict(ecolor=OKABE_ITO["black"], lw=1.1),
+        )
         for idx, e in enumerate(exp_names):
             fold_vals = [f["test_pooled"][metric] for f in summaries[e]["per_fold"]]
-            jitter = rng.uniform(-0.12, 0.12, size=len(fold_vals))
-            ax.scatter(np.full(len(fold_vals), idx) + jitter, fold_vals, color="black", s=26, zorder=4, alpha=0.85)
+            jitter = rng.uniform(-0.10, 0.10, size=len(fold_vals))
+            ax.scatter(
+                np.full(len(fold_vals), idx) + jitter,
+                fold_vals,
+                color=OKABE_ITO["black"],
+                s=22,
+                zorder=4,
+                alpha=0.82,
+            )
             if math.isfinite(means[idx]):
+                sd_v = stds[idx] if math.isfinite(stds[idx]) else 0.0
                 ax.text(
                     bars[idx].get_x() + bars[idx].get_width() / 2.0,
-                    means[idx] + (stds[idx] if math.isfinite(stds[idx]) else 0.0) + 0.01,
-                    f"{means[idx]:.3f}±{stds[idx]:.3f}",
+                    min(1.03, means[idx] + sd_v + 0.012),
+                    f"{means[idx]:.3f}±{sd_v:.3f}",
                     ha="center",
                     va="bottom",
-                    fontsize=8.5,
+                    fontsize=8.2,
+                    color=OKABE_ITO["black"],
                 )
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=20, ha="right")
+        ax.set_xticklabels(labels, rotation=18, ha="right")
         ax.set_title(title)
-        ax.set_ylim(0.0, 1.08)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.set_ylim(0.0, 1.09)
+        ax.grid(axis="y")
 
-    # Panel C: Supporting metrics (Bal Acc, F1 Target, Sensitivity, Specificity)
     ax_sup = axes[1, 0]
     width = 0.18
     sup_metrics = [
-        ("balanced_accuracy", "Bal Acc"),
-        ("f1_target", "F1 Target"),
-        ("sensitivity", "Sensitivity"),
-        ("specificity", "Specificity"),
+        ("balanced_accuracy", "Bal Acc", OKABE_ITO["blue"]),
+        ("f1_target", "F1 Target", OKABE_ITO["green"]),
+        ("sensitivity", "Sensitivity", OKABE_ITO["orange"]),
+        ("specificity", "Specificity", OKABE_ITO["sky"]),
     ]
-    for m_i, (m_key, m_label) in enumerate(sup_metrics):
+    for m_i, (m_key, m_label, m_col) in enumerate(sup_metrics):
         m_means = [summaries[e]["test"]["fold_pooled"][m_key]["mean"] for e in exp_names]
         m_stds = [summaries[e]["test"]["fold_pooled"][m_key]["std"] for e in exp_names]
         offset = (m_i - 1.5) * width
-        ax_sup.bar(x + offset, m_means, width=width, yerr=m_stds, capsize=3, label=m_label, alpha=0.85)
+        ax_sup.bar(
+            x + offset,
+            m_means,
+            width=width,
+            yerr=m_stds,
+            capsize=2.5,
+            color=m_col,
+            edgecolor=OKABE_ITO["black"],
+            linewidth=0.5,
+            label=m_label,
+            alpha=0.88,
+        )
     ax_sup.set_xticks(x)
-    ax_sup.set_xticklabels(labels, rotation=20, ha="right")
-    ax_sup.set_ylim(0.0, 1.05)
-    ax_sup.set_title("Supporting Metrics (Fold Pooled Mean ± SD)")
-    ax_sup.legend(ncol=2, fontsize=8.5)
-    ax_sup.grid(axis="y", linestyle="--", alpha=0.4)
+    ax_sup.set_xticklabels(labels, rotation=18, ha="right")
+    ax_sup.set_ylim(0.0, 1.06)
+    ax_sup.set_title("(C) Supporting Metrics (Fold-Pooled Mean ± SD)")
+    ax_sup.legend(ncol=2, frameon=False)
+    ax_sup.grid(axis="y")
 
-    # Panel D: Feature Count & Train Time (Mean ± SD per fold)
     ax_cost = axes[1, 1]
     feat_counts = [summaries[e]["n_features"] for e in exp_names]
     time_means = [summaries[e]["train_duration_sec"]["mean"] for e in exp_names]
     time_stds = [summaries[e]["train_duration_sec"]["std"] for e in exp_names]
 
-    b_feat = ax_cost.bar(x - 0.18, feat_counts, width=0.34, color="#4c78a8", alpha=0.85, label="Feature Count")
-    ax_cost.set_ylabel("Feature Count", color="#4c78a8")
-    ax_cost.tick_params(axis="y", labelcolor="#4c78a8")
+    b_feat = ax_cost.bar(
+        x - 0.18,
+        feat_counts,
+        width=0.34,
+        color=OKABE_ITO["blue"],
+        alpha=0.85,
+        edgecolor=OKABE_ITO["black"],
+        linewidth=0.6,
+        label="Features",
+    )
+    ax_cost.set_ylabel("Feature Count", color=OKABE_ITO["blue"])
+    ax_cost.tick_params(axis="y", labelcolor=OKABE_ITO["blue"])
     for idx, val in enumerate(feat_counts):
-        ax_cost.text(b_feat[idx].get_x() + b_feat[idx].get_width() / 2.0, val, f"{val:,}", ha="center", va="bottom", fontsize=8)
+        ax_cost.text(
+            b_feat[idx].get_x() + b_feat[idx].get_width() / 2.0,
+            val * 1.01,
+            f"{val:,}",
+            ha="center",
+            va="bottom",
+            fontsize=7.8,
+            color=OKABE_ITO["black"],
+        )
 
     ax_time = ax_cost.twinx()
-    ax_time.bar(x + 0.18, time_means, width=0.34, yerr=time_stds, capsize=4, color="#f58518", alpha=0.85, label="Fold Train Time (s)")
-    ax_time.set_ylabel("Fold Train Time (s, Mean ± SD)", color="#f58518")
-    ax_time.tick_params(axis="y", labelcolor="#f58518")
+    ax_time.spines["top"].set_visible(False)
+    ax_time.bar(
+        x + 0.18,
+        time_means,
+        width=0.34,
+        yerr=time_stds,
+        capsize=3.5,
+        color=OKABE_ITO["orange"],
+        alpha=0.85,
+        edgecolor=OKABE_ITO["black"],
+        linewidth=0.6,
+        label="Train Time (s)",
+    )
+    ax_time.set_ylabel("Fold Train Time (s, Mean ± SD)", color=OKABE_ITO["orange"])
+    ax_time.tick_params(axis="y", labelcolor=OKABE_ITO["orange"])
     ax_cost.set_xticks(x)
-    ax_cost.set_xticklabels(labels, rotation=20, ha="right")
-    ax_cost.set_title("Feature Dimensionality & Training Duration")
-    ax_cost.grid(axis="y", linestyle="--", alpha=0.3)
+    ax_cost.set_xticklabels(labels, rotation=18, ha="right")
+    ax_cost.set_title("(D) Feature Count & Per-Fold Training Time")
+    ax_cost.grid(axis="y")
+    saved_files.append(_save_pub_png(fig, protocol_dir / "cs5_metric_comparison.png"))
 
-    p1 = protocol_dir / "cs5_metric_comparison.png"
-    fig.savefig(p1, dpi=200)
-    plt.close(fig)
-    saved_files.append(p1.name)
-
-    # 2. cs5_subject_macro_comparison.png (Equal-weight subject-macro metrics + per-subject scatter)
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
-    fig.suptitle("ML3 Cross-Subject 5-Fold — Subject-Macro Metrics (Equal Subject Weight)", fontsize=13, fontweight="bold")
+    # 2. cs5_subject_macro_comparison.png
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 9.6), constrained_layout=True)
+    fig.suptitle("ML3 Cross-Subject 5-Fold — Subject-Macro Generalization (N = 39 Subjects, Equal Weight)")
     for ax, (metric, title) in zip(
         axes.ravel(),
         (
-            ("pr_auc", "Subject-Macro PR-AUC (Mean ± SD + Per-Subject Dots)"),
-            ("roc_auc", "Subject-Macro ROC-AUC (Mean ± SD + Per-Subject Dots)"),
-            ("balanced_accuracy", "Subject-Macro Balanced Accuracy (Mean ± SD)"),
-            ("f1_target", "Subject-Macro F1 Target (Mean ± SD)"),
+            ("pr_auc", "(A) Subject-Macro PR-AUC"),
+            ("roc_auc", "(B) Subject-Macro ROC-AUC"),
+            ("balanced_accuracy", "(C) Subject-Macro Balanced Accuracy"),
+            ("f1_target", "(D) Subject-Macro F1-Target"),
         ),
     ):
         means = [summaries[e]["test"]["subject_macro"][metric]["mean"] for e in exp_names]
         stds = [summaries[e]["test"]["subject_macro"][metric]["std"] for e in exp_names]
         medians = [summaries[e]["test"]["subject_macro"][metric]["median"] for e in exp_names]
-        ax.bar(x, means, yerr=stds, capsize=5, color=colors, alpha=0.72, edgecolor="black", linewidth=0.8)
-        ax.scatter(x, medians, marker="D", color="gold", edgecolor="black", s=45, zorder=5, label="Median")
+        ax.bar(
+            x,
+            means,
+            width=0.56,
+            yerr=stds,
+            capsize=4,
+            color=colors,
+            alpha=0.76,
+            edgecolor=OKABE_ITO["black"],
+            linewidth=0.8,
+            error_kw=dict(ecolor=OKABE_ITO["black"], lw=1.1),
+        )
+        ax.scatter(
+            x,
+            medians,
+            marker="D",
+            color=OKABE_ITO["yellow"],
+            edgecolor=OKABE_ITO["black"],
+            s=46,
+            zorder=5,
+            label="Median across subjects",
+        )
         for idx, e in enumerate(exp_names):
             sub_vals = [
                 float(s[metric])
                 for s in summaries[e]["per_subject"].values()
                 if s.get(metric) is not None and math.isfinite(float(s[metric]))
             ]
-            jitter = rng.uniform(-0.18, 0.18, size=len(sub_vals))
-            ax.scatter(np.full(len(sub_vals), idx) + jitter, sub_vals, color="#222222", s=16, alpha=0.55, zorder=4)
+            jitter = rng.uniform(-0.16, 0.16, size=len(sub_vals))
+            ax.scatter(
+                np.full(len(sub_vals), idx) + jitter,
+                sub_vals,
+                color=OKABE_ITO["black"],
+                s=14,
+                alpha=0.45,
+                zorder=4,
+            )
             if math.isfinite(means[idx]):
+                sd_v = stds[idx] if math.isfinite(stds[idx]) else 0.0
                 ax.text(
                     idx,
-                    min(1.03, means[idx] + (stds[idx] if math.isfinite(stds[idx]) else 0.0) + 0.015),
-                    f"{means[idx]:.3f}±{stds[idx]:.3f}",
+                    min(1.04, means[idx] + sd_v + 0.014),
+                    f"{means[idx]:.3f}±{sd_v:.3f}",
                     ha="center",
                     va="bottom",
-                    fontsize=8.5,
+                    fontsize=8.2,
+                    color=OKABE_ITO["black"],
                 )
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=20, ha="right")
-        ax.set_ylim(0.0, 1.09)
+        ax.set_xticklabels(labels, rotation=18, ha="right")
+        ax.set_ylim(0.0, 1.10)
         ax.set_title(title)
-        ax.legend(loc="lower right", fontsize=8)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.legend(loc="lower right", frameon=False)
+        ax.grid(axis="y")
+    saved_files.append(_save_pub_png(fig, protocol_dir / "cs5_subject_macro_comparison.png"))
 
-    p2 = protocol_dir / "cs5_subject_macro_comparison.png"
-    fig.savefig(p2, dpi=200)
-    plt.close(fig)
-    saved_files.append(p2.name)
-
-    # 3. cs5_fold_profiles.png (Fold-by-fold trajectories across scenarios)
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9.5), constrained_layout=True)
-    fig.suptitle("ML3 Cross-Subject 5-Fold — Per-Fold Profiles Across Scenarios", fontsize=13, fontweight="bold")
-    for ax, field_kind, title in (
-        (axes[0, 0], "pr_auc", "Fold Test PR-AUC Profile"),
-        (axes[0, 1], "roc_auc", "Fold Test ROC-AUC Profile"),
-        (axes[1, 0], "balanced_accuracy", "Fold Test Balanced Accuracy Profile"),
-        (axes[1, 1], "best_iteration", "Fold Early-Stopping Best Iteration"),
+    # 3. cs5_fold_profiles.png (Discrete Fold 0..4 ticks + distinct Okabe-Ito markers)
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 9.2), constrained_layout=True)
+    fig.suptitle("ML3 Cross-Subject 5-Fold — Consistency Across Held-Out Subject Partitions")
+    all_fold_ids = sorted(
+        {int(r["fold"]) for e in exp_names for r in summaries[e]["per_fold"]}
+    )
+    for ax, field_kind, title, ylabel in (
+        (axes[0, 0], "pr_auc", "(A) Test PR-AUC by Partition", "PR-AUC"),
+        (axes[0, 1], "roc_auc", "(B) Test ROC-AUC by Partition", "ROC-AUC"),
+        (axes[1, 0], "balanced_accuracy", "(C) Test Balanced Accuracy by Partition", "Balanced Accuracy"),
+        (axes[1, 1], "best_iteration", "(D) Early-Stopping Best Iteration", "Trees Selected (Val AUCPR)"),
     ):
         for e in exp_names:
             f_recs = sorted(summaries[e]["per_fold"], key=lambda r: int(r["fold"]))
             f_ids = [int(r["fold"]) for r in f_recs]
             if field_kind == "best_iteration":
-                y_vals = [int(r["best_iteration"]) for r in f_recs]
+                y_vals = [int(r["best_iteration"]) + 1 for r in f_recs]
             else:
                 y_vals = [float(r["test_pooled"][field_kind]) for r in f_recs]
-            ax.plot(f_ids, y_vals, marker="o", linewidth=2.0, color=_exp_color(e), label=_exp_label(e))
-        ax.set_xlabel("Fold Index")
+            ax.plot(
+                f_ids,
+                y_vals,
+                marker=_exp_marker(e),
+                markersize=6.2,
+                linewidth=1.9,
+                color=_exp_color(e),
+                label=_exp_label(e),
+            )
+        if field_kind == "best_iteration":
+            max_trees = int(summaries[exp_names[0]].get("model_config", {}).get("n_estimators", 2000))
+            ax.axhline(
+                max_trees,
+                color=OKABE_ITO["red"],
+                ls=":",
+                lw=1.0,
+                alpha=0.75,
+                label=f"Max trees ({max_trees})",
+            )
+        ax.set_xticks(all_fold_ids)
+        ax.set_xticklabels([f"Fold {k}" for k in all_fold_ids])
+        ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(True, linestyle="--", alpha=0.4)
-        ax.legend(fontsize=8.5)
+        ax.grid(True)
+        ax.legend(frameon=False, ncol=2 if len(exp_names) > 4 else 1)
+    saved_files.append(_save_pub_png(fig, protocol_dir / "cs5_fold_profiles.png"))
 
-    p3 = protocol_dir / "cs5_fold_profiles.png"
-    fig.savefig(p3, dpi=200)
-    plt.close(fig)
-    saved_files.append(p3.name)
-
-    # 4. cs5_window_paired_deltas.png (Paired differences W8-W5, Combined-Temporal, Combined-Wavelet)
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), constrained_layout=True)
-    fig.suptitle("ML3 Cross-Subject 5-Fold — Paired Subject-Level Differences (Mean ± SD)", fontsize=13, fontweight="bold")
+    # 4. cs5_window_paired_deltas.png
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 6.2), constrained_layout=True)
+    fig.suptitle("ML3 Cross-Subject 5-Fold — Paired Per-Subject Differences (N = 39 Subjects)")
     delta_keys = [
         k
         for k in (
@@ -1211,20 +1418,41 @@ def _generate_cs5_plots(
         if k in paired_deltas
     ]
     for ax, metric, title in (
-        (axes[0], "pr_auc", "Paired Δ PR-AUC (Per-Subject)"),
-        (axes[1], "roc_auc", "Paired Δ ROC-AUC (Per-Subject)"),
+        (axes[0], "pr_auc", "(A) Paired Δ PR-AUC (LHS − RHS)"),
+        (axes[1], "roc_auc", "(B) Paired Δ ROC-AUC (LHS − RHS)"),
     ):
-        ax.axhline(0.0, color="crimson", linestyle="--", linewidth=1.2)
+        ax.axhline(0.0, color=OKABE_ITO["red"], linestyle="--", linewidth=1.15)
         if delta_keys:
             dx = np.arange(len(delta_keys))
             d_labels = [paired_deltas[k]["comparison"] for k in delta_keys]
             d_means = [paired_deltas[k]["subject_paired_delta"][metric]["mean"] for k in delta_keys]
             d_stds = [paired_deltas[k]["subject_paired_delta"][metric]["std"] for k in delta_keys]
-            ax.bar(dx, d_means, yerr=d_stds, capsize=5, color="#54a24b", alpha=0.75, edgecolor="black")
+            bar_cols = [
+                OKABE_ITO["green"] if (math.isfinite(m) and m >= 0.0) else OKABE_ITO["orange"]
+                for m in d_means
+            ]
+            ax.bar(
+                dx,
+                d_means,
+                width=0.56,
+                yerr=d_stds,
+                capsize=4,
+                color=bar_cols,
+                alpha=0.78,
+                edgecolor=OKABE_ITO["black"],
+                linewidth=0.8,
+            )
             for idx, k in enumerate(delta_keys):
                 vec = paired_deltas[k]["_subject_vectors"][metric]
                 jitter = rng.uniform(-0.15, 0.15, size=len(vec))
-                ax.scatter(np.full(len(vec), idx) + jitter, vec, color="#1f1f1f", s=16, alpha=0.55, zorder=4)
+                ax.scatter(
+                    np.full(len(vec), idx) + jitter,
+                    vec,
+                    color=OKABE_ITO["black"],
+                    s=14,
+                    alpha=0.45,
+                    zorder=4,
+                )
                 if math.isfinite(d_means[idx]):
                     ax.text(
                         idx,
@@ -1232,20 +1460,25 @@ def _generate_cs5_plots(
                         f"{d_means[idx]:+.4f}",
                         ha="center",
                         va="bottom" if d_means[idx] >= 0 else "top",
-                        fontsize=8.5,
+                        fontsize=8.2,
                         fontweight="bold",
+                        color=OKABE_ITO["black"],
                     )
             ax.set_xticks(dx)
-            ax.set_xticklabels(d_labels, rotation=25, ha="right")
+            ax.set_xticklabels(d_labels, rotation=22, ha="right")
         else:
-            ax.text(0.5, 0.5, "Run ≥2 comparable scenarios to view paired deltas", ha="center", va="center", transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "Run ≥2 comparable scenarios to view paired deltas",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        ax.set_ylabel(f"Δ {metric.upper()}")
         ax.set_title(title)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    p4 = protocol_dir / "cs5_window_paired_deltas.png"
-    fig.savefig(p4, dpi=200)
-    plt.close(fig)
-    saved_files.append(p4.name)
+        ax.grid(axis="y")
+    saved_files.append(_save_pub_png(fig, protocol_dir / "cs5_window_paired_deltas.png"))
     return saved_files
 
 
@@ -1254,6 +1487,7 @@ def _generate_loso_plots(
     summaries: Mapping[str, Mapping[str, Any]],
     paired_deltas: Mapping[str, Mapping[str, Any]],
 ) -> List[str]:
+    setup_publication_style()
     exp_names = list(summaries.keys())
     x = np.arange(len(exp_names))
     colors = [_exp_color(e) for e in exp_names]
@@ -1261,13 +1495,13 @@ def _generate_loso_plots(
     rng = np.random.default_rng(42)
     saved_files: List[str] = []
 
-    # 1. loso_metric_distribution.png (Boxplots + 39 subject dots + Mean ± SD + Feature Count & Train Time)
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
-    fig.suptitle("ML3 LOSO — Held-Out Subject Distributions, Feature Count & Train Time", fontsize=13, fontweight="bold")
+    # 1. loso_metric_distribution.png
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 9.6), constrained_layout=True)
+    fig.suptitle("ML3 LOSO (N = 39 Held-Out Subjects) — Distributions, Dimensionality & Train Time")
     for ax, metric, title in (
-        (axes[0, 0], "pr_auc", "LOSO Per-Subject PR-AUC Distribution"),
-        (axes[0, 1], "roc_auc", "LOSO Per-Subject ROC-AUC Distribution"),
-        (axes[1, 0], "balanced_accuracy", "LOSO Per-Subject Balanced Accuracy Distribution"),
+        (axes[0, 0], "pr_auc", "(A) LOSO Per-Subject PR-AUC"),
+        (axes[0, 1], "roc_auc", "(B) LOSO Per-Subject ROC-AUC"),
+        (axes[1, 0], "balanced_accuracy", "(C) LOSO Per-Subject Balanced Accuracy"),
     ):
         series = []
         for e in exp_names:
@@ -1277,59 +1511,114 @@ def _generate_loso_plots(
                 if s.get(metric) is not None and math.isfinite(float(s[metric]))
             ]
             series.append(vals if vals else [float("nan")])
-        bp = ax.boxplot(series, positions=x, widths=0.45, patch_artist=True, showfliers=False)
+        bp = ax.boxplot(
+            series,
+            positions=x,
+            widths=0.46,
+            patch_artist=True,
+            showfliers=False,
+            medianprops=dict(color=OKABE_ITO["black"], lw=1.4),
+        )
         for patch, c in zip(bp["boxes"], colors):
             patch.set_facecolor(c)
-            patch.set_alpha(0.55)
+            patch.set_edgecolor(OKABE_ITO["black"])
+            patch.set_alpha(0.60)
         for idx, e in enumerate(exp_names):
             vals = series[idx]
             mean_v = summaries[e]["test"]["subject_macro"][metric]["mean"]
             std_v = summaries[e]["test"]["subject_macro"][metric]["std"]
             jitter = rng.uniform(-0.14, 0.14, size=len(vals))
-            ax.scatter(np.full(len(vals), idx) + jitter, vals, color="#222222", s=18, alpha=0.65, zorder=4)
-            ax.errorbar([idx], [mean_v], yerr=[std_v], fmt="D", color="gold", markeredgecolor="black", capsize=5, zorder=5)
+            ax.scatter(
+                np.full(len(vals), idx) + jitter,
+                vals,
+                color=OKABE_ITO["black"],
+                s=16,
+                alpha=0.50,
+                zorder=4,
+            )
+            ax.errorbar(
+                [idx],
+                [mean_v],
+                yerr=[std_v],
+                fmt="D",
+                color=OKABE_ITO["yellow"],
+                markeredgecolor=OKABE_ITO["black"],
+                ecolor=OKABE_ITO["black"],
+                capsize=4,
+                zorder=5,
+            )
             if math.isfinite(mean_v):
-                ax.text(idx, min(1.03, max(vals) + 0.02), f"{mean_v:.3f}±{std_v:.3f}", ha="center", va="bottom", fontsize=8.5)
+                ax.text(
+                    idx,
+                    min(1.04, max(vals) + 0.02),
+                    f"{mean_v:.3f}±{std_v:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8.2,
+                    color=OKABE_ITO["black"],
+                )
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=15, ha="right")
-        ax.set_ylim(0.0, 1.08)
+        ax.set_ylim(0.0, 1.09)
         ax.set_title(title)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.grid(axis="y")
 
     ax_cost = axes[1, 1]
     feat_counts = [summaries[e]["n_features"] for e in exp_names]
     time_means = [summaries[e]["train_duration_sec"]["mean"] for e in exp_names]
     time_stds = [summaries[e]["train_duration_sec"]["std"] for e in exp_names]
-    b_feat = ax_cost.bar(x - 0.18, feat_counts, width=0.34, color="#4c78a8", alpha=0.85, label="Feature Count")
-    ax_cost.set_ylabel("Feature Count", color="#4c78a8")
-    ax_cost.tick_params(axis="y", labelcolor="#4c78a8")
+    b_feat = ax_cost.bar(
+        x - 0.18,
+        feat_counts,
+        width=0.34,
+        color=OKABE_ITO["blue"],
+        alpha=0.85,
+        edgecolor=OKABE_ITO["black"],
+        linewidth=0.6,
+    )
+    ax_cost.set_ylabel("Feature Count", color=OKABE_ITO["blue"])
+    ax_cost.tick_params(axis="y", labelcolor=OKABE_ITO["blue"])
     for idx, val in enumerate(feat_counts):
-        ax_cost.text(b_feat[idx].get_x() + b_feat[idx].get_width() / 2.0, val, f"{val:,}", ha="center", va="bottom", fontsize=8)
+        ax_cost.text(
+            b_feat[idx].get_x() + b_feat[idx].get_width() / 2.0,
+            val * 1.01,
+            f"{val:,}",
+            ha="center",
+            va="bottom",
+            fontsize=7.8,
+        )
     ax_time = ax_cost.twinx()
-    ax_time.bar(x + 0.18, time_means, width=0.34, yerr=time_stds, capsize=4, color="#f58518", alpha=0.85, label="Fold Train Time (s)")
-    ax_time.set_ylabel("Fold Train Time (s, Mean ± SD)", color="#f58518")
-    ax_time.tick_params(axis="y", labelcolor="#f58518")
+    ax_time.spines["top"].set_visible(False)
+    ax_time.bar(
+        x + 0.18,
+        time_means,
+        width=0.34,
+        yerr=time_stds,
+        capsize=3.5,
+        color=OKABE_ITO["orange"],
+        alpha=0.85,
+        edgecolor=OKABE_ITO["black"],
+        linewidth=0.6,
+    )
+    ax_time.set_ylabel("Fold Train Time (s, Mean ± SD)", color=OKABE_ITO["orange"])
+    ax_time.tick_params(axis="y", labelcolor=OKABE_ITO["orange"])
     ax_cost.set_xticks(x)
     ax_cost.set_xticklabels(labels, rotation=15, ha="right")
-    ax_cost.set_title("Feature Count & Per-Subject Fold Train Time")
-    ax_cost.grid(axis="y", linestyle="--", alpha=0.3)
+    ax_cost.set_title("(D) Feature Count & Per-Subject Fold Train Time")
+    ax_cost.grid(axis="y")
+    saved_files.append(_save_pub_png(fig, protocol_dir / "loso_metric_distribution.png"))
 
-    p1 = protocol_dir / "loso_metric_distribution.png"
-    fig.savefig(p1, dpi=200)
-    plt.close(fig)
-    saved_files.append(p1.name)
-
-    # 2. loso_per_subject_metrics.png (Subject-by-subject PR-AUC & ROC-AUC profiles)
+    # 2. loso_per_subject_metrics.png
     all_subjects = sorted(
         {sub for e in exp_names for sub in summaries[e]["per_subject"].keys()},
         key=_natural_sort_key,
     )
     sx = np.arange(len(all_subjects))
-    fig, axes = plt.subplots(2, 1, figsize=(16, 9), constrained_layout=True, sharex=True)
-    fig.suptitle("ML3 LOSO — Per-Subject Generalization Profile (Temporal vs Combined)", fontsize=13, fontweight="bold")
+    fig, axes = plt.subplots(2, 1, figsize=(15.5, 8.6), constrained_layout=True, sharex=True)
+    fig.suptitle("ML3 LOSO — Per-Subject Generalization Profile Across 39 Subjects")
     for ax, metric, title in (
-        (axes[0], "pr_auc", "Per-Subject Test PR-AUC"),
-        (axes[1], "roc_auc", "Per-Subject Test ROC-AUC"),
+        (axes[0], "pr_auc", "(A) Held-Out Subject PR-AUC"),
+        (axes[1], "roc_auc", "(B) Held-Out Subject ROC-AUC"),
     ):
         for e in exp_names:
             sub_map = summaries[e]["per_subject"]
@@ -1337,22 +1626,27 @@ def _generate_loso_plots(
                 float(sub_map[s][metric]) if s in sub_map and sub_map[s].get(metric) is not None else float("nan")
                 for s in all_subjects
             ]
-            ax.plot(sx, y_vals, marker="o", markersize=4.5, linewidth=1.5, color=_exp_color(e), label=_exp_label(e), alpha=0.9)
+            ax.plot(
+                sx,
+                y_vals,
+                marker=_exp_marker(e),
+                markersize=4.6,
+                linewidth=1.5,
+                color=_exp_color(e),
+                label=_exp_label(e),
+                alpha=0.92,
+            )
         ax.set_ylabel(metric.upper())
         ax.set_title(title)
-        ax.grid(True, linestyle="--", alpha=0.4)
-        ax.legend(loc="lower right", ncol=len(exp_names), fontsize=9)
+        ax.grid(True)
+        ax.legend(loc="lower right", ncol=len(exp_names), frameon=False)
     axes[1].set_xticks(sx)
-    axes[1].set_xticklabels(all_subjects, rotation=60, ha="right", fontsize=8)
+    axes[1].set_xticklabels(all_subjects, rotation=55, ha="right", fontsize=8.0)
+    saved_files.append(_save_pub_png(fig, protocol_dir / "loso_per_subject_metrics.png"))
 
-    p2 = protocol_dir / "loso_per_subject_metrics.png"
-    fig.savefig(p2, dpi=200)
-    plt.close(fig)
-    saved_files.append(p2.name)
-
-    # 3. loso_c5_vs_c8_deltas.png (Paired subject deltas: C8-C5, C5-Temporal, C8-Temporal)
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), constrained_layout=True)
-    fig.suptitle("ML3 LOSO — Paired Per-Subject Deltas (C5 vs C8 & Combined vs Temporal)", fontsize=13, fontweight="bold")
+    # 3. loso_c5_vs_c8_deltas.png
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 6.2), constrained_layout=True)
+    fig.suptitle("ML3 LOSO — Paired Per-Subject Differences (C5 vs C8 & Combined vs Temporal)")
     loso_delta_keys = [
         k
         for k in (
@@ -1363,20 +1657,41 @@ def _generate_loso_plots(
         if k in paired_deltas
     ]
     for ax, metric, title in (
-        (axes[0], "pr_auc", "LOSO Paired Δ PR-AUC (Mean ± SD Across Subjects)"),
-        (axes[1], "roc_auc", "LOSO Paired Δ ROC-AUC (Mean ± SD Across Subjects)"),
+        (axes[0], "pr_auc", "(A) LOSO Paired Δ PR-AUC"),
+        (axes[1], "roc_auc", "(B) LOSO Paired Δ ROC-AUC"),
     ):
-        ax.axhline(0.0, color="crimson", linestyle="--", linewidth=1.2)
+        ax.axhline(0.0, color=OKABE_ITO["red"], linestyle="--", linewidth=1.15)
         if loso_delta_keys:
             dx = np.arange(len(loso_delta_keys))
             d_labels = [paired_deltas[k]["comparison"] for k in loso_delta_keys]
             d_means = [paired_deltas[k]["subject_paired_delta"][metric]["mean"] for k in loso_delta_keys]
             d_stds = [paired_deltas[k]["subject_paired_delta"][metric]["std"] for k in loso_delta_keys]
-            ax.bar(dx, d_means, yerr=d_stds, capsize=5, color="#72b7b2", alpha=0.78, edgecolor="black")
+            bar_cols = [
+                OKABE_ITO["green"] if (math.isfinite(m) and m >= 0.0) else OKABE_ITO["orange"]
+                for m in d_means
+            ]
+            ax.bar(
+                dx,
+                d_means,
+                width=0.52,
+                yerr=d_stds,
+                capsize=4,
+                color=bar_cols,
+                alpha=0.78,
+                edgecolor=OKABE_ITO["black"],
+                linewidth=0.8,
+            )
             for idx, k in enumerate(loso_delta_keys):
                 vec = paired_deltas[k]["_subject_vectors"][metric]
                 jitter = rng.uniform(-0.14, 0.14, size=len(vec))
-                ax.scatter(np.full(len(vec), idx) + jitter, vec, color="#1f1f1f", s=18, alpha=0.6, zorder=4)
+                ax.scatter(
+                    np.full(len(vec), idx) + jitter,
+                    vec,
+                    color=OKABE_ITO["black"],
+                    s=15,
+                    alpha=0.48,
+                    zorder=4,
+                )
                 if math.isfinite(d_means[idx]):
                     ax.text(
                         idx,
@@ -1384,21 +1699,603 @@ def _generate_loso_plots(
                         f"{d_means[idx]:+.4f}±{d_stds[idx]:.4f}",
                         ha="center",
                         va="bottom" if d_means[idx] >= 0 else "top",
-                        fontsize=8.5,
+                        fontsize=8.2,
                         fontweight="bold",
                     )
             ax.set_xticks(dx)
-            ax.set_xticklabels(d_labels, rotation=20, ha="right")
+            ax.set_xticklabels(d_labels, rotation=18, ha="right")
         else:
-            ax.text(0.5, 0.5, "Run ≥2 LOSO experiments (temporal, combined_w5, combined_w8) for paired deltas", ha="center", va="center", transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "Run ≥2 LOSO experiments (temporal, combined_w5, combined_w8) for paired deltas",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        ax.set_ylabel(f"Δ {metric.upper()}")
         ax.set_title(title)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    p3 = protocol_dir / "loso_c5_vs_c8_deltas.png"
-    fig.savefig(p3, dpi=200)
-    plt.close(fig)
-    saved_files.append(p3.name)
+        ax.grid(axis="y")
+    saved_files.append(_save_pub_png(fig, protocol_dir / "loso_c5_vs_c8_deltas.png"))
     return saved_files
+
+
+def backfill_learning_curves_from_checkpoints(
+    *,
+    protocol_dir: Path | str,
+    features_dir: Path | str,
+    splits_dir: Path | str,
+    protocol: ProtocolName | str,
+    device: str = "cuda",
+    n_curve_points: int = 32,
+) -> int:
+    """Reconstruct ``learning_curve.json`` & ``train_pooled`` from existing ``model.json`` checkpoints.
+
+    This allows inspecting training vs validation overfitting curves on already
+    completed runs (such as CS5) in a few seconds without retraining any fold.
+    """
+    p_dir = Path(protocol_dir)
+    norm_proto = normalize_protocol_name(protocol)
+    summaries = _discover_completed_experiment_summaries(p_dir)
+    if not summaries:
+        return 0
+
+    missing_exps: list[str] = []
+    for exp_name in summaries:
+        exp_dir = p_dir / exp_name
+        for fold_dir in sorted(exp_dir.glob("fold_*")):
+            if not (fold_dir / "model.json").is_file():
+                continue
+            lc_ok = (fold_dir / "learning_curve.json").is_file()
+            m_path = fold_dir / "metrics.json"
+            m_data = json.loads(m_path.read_text(encoding="utf-8")) if m_path.is_file() else {}
+            if not lc_ok or "train_pooled" not in m_data:
+                if exp_name not in missing_exps:
+                    missing_exps.append(exp_name)
+
+    if not missing_exps:
+        return 0
+
+    all_folds, _ = load_ml3_splits(splits_dir, norm_proto)
+    fold_by_idx = {f.fold: f for f in all_folds}
+    req_groups = required_feature_groups_for_experiments(missing_exps)
+    needs_gamma = any(FEATURE_SCENARIO_SPECS[e].uses_gamma for e in missing_exps)
+    dataset = load_ml3_feature_dataset(
+        features_dir,
+        required_groups=req_groups,
+        include_gamma_support=needs_gamma,
+    )
+
+    updated_folds = 0
+    cfg = ML3XGBoostConfig(device=device)
+
+    for exp_name in missing_exps:
+        scenario_matrix = dataset.build_scenario(exp_name)
+        exp_dir = p_dir / exp_name
+        fold_metrics_list = []
+        fold_preds_list = []
+
+        for fold_dir in sorted(exp_dir.glob("fold_*")):
+            m_path = fold_dir / "metrics.json"
+            p_path = fold_dir / "predictions.npz"
+            mod_path = fold_dir / "model.json"
+            if not (m_path.is_file() and p_path.is_file() and mod_path.is_file()):
+                continue
+
+            f_metrics = json.loads(m_path.read_text(encoding="utf-8"))
+            fold_idx = int(f_metrics["fold"])
+            split = fold_by_idx[fold_idx]
+            train_idx, val_idx, _ = resolve_subject_fold_indices(
+                split, scenario_matrix.subject_ids, scenario_matrix.trial_uids
+            )
+            X_tr = scenario_matrix.values[train_idx]
+            y_tr = scenario_matrix.targets[train_idx]
+            X_va = scenario_matrix.values[val_idx]
+            y_va = scenario_matrix.targets[val_idx]
+
+            best_iter = int(f_metrics["best_iteration"])
+            model = ML3XGBoostModel.load_model(mod_path, config=cfg, best_iteration=best_iter)
+            assert model.estimator_ is not None
+            model.estimator_.set_params(device=device)
+
+            if "train_pooled" not in f_metrics:
+                tr_prob = model.predict_proba_positive(X_tr)
+                f_metrics["train_pooled"] = _format_metric_with_confusion(
+                    compute_binary_metrics(y_tr, tr_prob, threshold=float(f_metrics["threshold"]))
+                )
+                _atomic_write_json(m_path, f_metrics)
+
+            lc_path = fold_dir / "learning_curve.json"
+            if not lc_path.is_file():
+                total_rounds = int(model.estimator_.get_booster().num_boosted_rounds())
+                grid = np.unique(
+                    np.concatenate(
+                        [
+                            np.linspace(1, max(1, total_rounds), num=min(n_curve_points, max(1, total_rounds)), dtype=int),
+                            np.array([min(total_rounds, best_iter + 1), total_rounds], dtype=int),
+                        ]
+                    )
+                )
+                tr_curve: list[float] = []
+                va_curve: list[float] = []
+                for ntree in grid:
+                    p_tr = model.estimator_.predict_proba(X_tr, iteration_range=(0, int(ntree)))[:, 1]
+                    p_va = model.estimator_.predict_proba(X_va, iteration_range=(0, int(ntree)))[:, 1]
+                    tr_curve.append(float(average_precision_score(y_tr, p_tr)))
+                    va_curve.append(float(average_precision_score(y_va, p_va)))
+                _atomic_write_json(
+                    lc_path,
+                    {
+                        "fold": fold_idx,
+                        "best_iteration": best_iter,
+                        "rounds": [int(v) for v in grid.tolist()],
+                        "train_aucpr": tr_curve,
+                        "val_aucpr": va_curve,
+                    },
+                )
+            updated_folds += 1
+            fold_metrics_list.append(f_metrics)
+            with np.load(p_path, allow_pickle=False) as payload:
+                fold_preds_list.append({k: np.asarray(payload[k]) for k in payload.files})
+
+            del model
+
+        if fold_metrics_list:
+            aggregate_experiment_results(
+                protocol=norm_proto,
+                experiment=exp_name,
+                exp_dir=exp_dir,
+                model_config=cfg,
+                fold_metrics_list=fold_metrics_list,
+                fold_preds_list=fold_preds_list,
+            )
+        del scenario_matrix
+        gc.collect()
+
+    return updated_folds
+
+
+def generate_ml3_diagnostic_plots(
+    *,
+    protocol: ProtocolName | str,
+    protocol_dir: Path | str,
+    summaries: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    features_dir: Optional[Path | str] = None,
+) -> List[str]:
+    """Generate Overfitting, ROC/PR, Feature Gain Breakdown, and Calibration plots."""
+    setup_publication_style()
+    norm_proto = normalize_protocol_name(protocol)
+    p_dir = Path(protocol_dir)
+    resolved_summaries = (
+        dict(summaries) if summaries is not None else _discover_completed_experiment_summaries(p_dir)
+    )
+    if not resolved_summaries:
+        return []
+
+    exp_names = list(resolved_summaries.keys())
+    saved: List[str] = []
+
+    # ── Diagnostic 1: Overfitting & Learning Curves ({proto}_overfitting_diagnostics.png) ──
+    curves_by_exp: Dict[str, List[Dict[str, Any]]] = {}
+    for e in exp_names:
+        f_curves = []
+        for lc_file in sorted((p_dir / e).glob("fold_*/learning_curve.json")):
+            f_curves.append(json.loads(lc_file.read_text(encoding="utf-8")))
+        if f_curves:
+            curves_by_exp[e] = f_curves
+
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.2), constrained_layout=True)
+    fig.suptitle(f"ML3 {norm_proto.upper()} — Training Overfitting & Generalization Diagnostics")
+
+    ax_lc = axes[0]
+    if curves_by_exp:
+        for e, lc_list in curves_by_exp.items():
+            col = _exp_color(e)
+            max_r = max(max(c["rounds"]) for c in lc_list)
+            common_r = np.linspace(1, max_r, num=min(120, max_r))
+            tr_interp = np.vstack([np.interp(common_r, c["rounds"], c["train_aucpr"]) for c in lc_list])
+            va_interp = np.vstack([np.interp(common_r, c["rounds"], c["val_aucpr"]) for c in lc_list])
+            tr_mean = tr_interp.mean(axis=0)
+            va_mean = va_interp.mean(axis=0)
+            va_std = va_interp.std(axis=0, ddof=1 if len(lc_list) > 1 else 0)
+
+            ax_lc.plot(common_r, tr_mean, ls="--", lw=1.35, color=col, alpha=0.75)
+            ax_lc.plot(common_r, va_mean, ls="-", lw=2.0, color=col, label=f"{_exp_label(e)} (Val — / Train --)")
+            ax_lc.fill_between(common_r, va_mean - va_std, va_mean + va_std, color=col, alpha=0.14)
+            mean_best = float(np.mean([int(c["best_iteration"]) + 1 for c in lc_list]))
+            ax_lc.axvline(mean_best, color=col, ls=":", lw=1.0, alpha=0.75)
+        ax_lc.set_xlabel("Boosting Trees")
+        ax_lc.set_ylabel("PR-AUC")
+        ax_lc.set_ylim(0.25, 1.03)
+        ax_lc.legend(fontsize=7.4, frameon=False, loc="lower right")
+    else:
+        ax_lc.text(
+            0.5,
+            0.5,
+            "Run backfill_learning_curves_from_checkpoints()\nto reconstruct Train/Val curves from model.json",
+            ha="center",
+            va="center",
+            transform=ax_lc.transAxes,
+        )
+    ax_lc.set_title("(A) Train (--) vs Val (—) Boosting PR-AUC")
+    ax_lc.grid(True)
+
+    # Panel (B) & (C): Train vs Validation vs Test Split Comparison
+    x = np.arange(len(exp_names))
+    w = 0.25
+    for ax, metric, title in (
+        (axes[1], "pr_auc", "(B) Train vs Val vs Test PR-AUC Gap"),
+        (axes[2], "balanced_accuracy", "(C) Train vs Val vs Test Balanced Accuracy Gap"),
+    ):
+        tr_means = []
+        for e in exp_names:
+            tr_block = resolved_summaries[e].get("train", {}).get("fold_pooled", {})
+            tr_means.append(tr_block.get(metric, {}).get("mean", float("nan")))
+        va_means = [resolved_summaries[e]["validation"]["fold_pooled"][metric]["mean"] for e in exp_names]
+        te_means = [resolved_summaries[e]["test"]["fold_pooled"][metric]["mean"] for e in exp_names]
+        te_stds = [resolved_summaries[e]["test"]["fold_pooled"][metric]["std"] for e in exp_names]
+
+        if any(math.isfinite(v) for v in tr_means):
+            ax.bar(x - w, tr_means, width=w, color=OKABE_ITO["sky"], edgecolor=OKABE_ITO["black"], lw=0.6, label="Train")
+        ax.bar(x, va_means, width=w, color=OKABE_ITO["yellow"], edgecolor=OKABE_ITO["black"], lw=0.6, label="Validation")
+        ax.bar(
+            x + w,
+            te_means,
+            width=w,
+            yerr=te_stds,
+            capsize=3,
+            color=OKABE_ITO["green"],
+            edgecolor=OKABE_ITO["black"],
+            lw=0.6,
+            label="Test",
+        )
+        for idx in range(len(exp_names)):
+            if math.isfinite(va_means[idx]) and math.isfinite(te_means[idx]):
+                gap = va_means[idx] - te_means[idx]
+                top_y = max(
+                    [v for v in (tr_means[idx], va_means[idx], te_means[idx]) if math.isfinite(v)]
+                )
+                ax.text(
+                    idx,
+                    min(1.04, top_y + 0.025),
+                    f"Val−Test:\n{gap:+.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7.3,
+                    color=OKABE_ITO["black"],
+                )
+        ax.set_xticks(x)
+        ax.set_xticklabels([_exp_label(e) for e in exp_names], rotation=18, ha="right")
+        ax.set_ylim(0.0, 1.12)
+        ax.set_title(title)
+        ax.legend(frameon=False, loc="lower right")
+        ax.grid(axis="y")
+
+    saved.append(_save_pub_png(fig, p_dir / f"{norm_proto}_overfitting_diagnostics.png"))
+
+    # ── Diagnostic 2: Out-of-Fold ROC & PR Curves ({proto}_roc_pr_curves.png) ──
+    oof_available = [e for e in exp_names if (p_dir / e / "oof_predictions.npz").is_file()]
+    if oof_available:
+        fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.4), constrained_layout=True)
+        fig.suptitle(f"ML3 {norm_proto.upper()} — Out-of-Fold Precision–Recall & ROC Curves")
+        ax_pr, ax_roc = axes
+        prevalence: Optional[float] = None
+
+        for e in oof_available:
+            with np.load(p_dir / e / "oof_predictions.npz", allow_pickle=False) as oof:
+                y_true = oof["y_true"].astype(np.int64)
+                y_prob = oof["y_prob"].astype(np.float64)
+            if len(np.unique(y_true)) < 2:
+                continue
+            if prevalence is None:
+                prevalence = float(np.mean(y_true == 1))
+            prec, rec, _ = precision_recall_curve(y_true, y_prob)
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            ap = resolved_summaries[e]["test"]["subject_macro"]["pr_auc"]["mean"]
+            auc_v = resolved_summaries[e]["test"]["subject_macro"]["roc_auc"]["mean"]
+            ax_pr.plot(rec, prec, lw=2.0, color=_exp_color(e), label=f"{_exp_label(e)} (Macro AP={ap:.3f})")
+            ax_roc.plot(fpr, tpr, lw=2.0, color=_exp_color(e), label=f"{_exp_label(e)} (Macro AUC={auc_v:.3f})")
+
+        if prevalence is not None:
+            ax_pr.axhline(
+                prevalence,
+                color=OKABE_ITO["grey"],
+                ls="--",
+                lw=1.0,
+                label=f"Target prevalence ({prevalence:.3f})",
+            )
+        ax_pr.set_xlabel("Recall (Sensitivity)")
+        ax_pr.set_ylabel("Precision")
+        ax_pr.set_xlim(0.0, 1.0)
+        ax_pr.set_ylim(0.0, 1.02)
+        ax_pr.set_title("(A) Out-of-Fold Precision–Recall Curve")
+        ax_pr.legend(loc="lower left", frameon=False)
+        ax_pr.grid(True)
+
+        ax_roc.plot([0, 1], [0, 1], color=OKABE_ITO["grey"], ls="--", lw=1.0, label="Chance (0.500)")
+        ax_roc.set_xlabel("False Positive Rate (1 − Specificity)")
+        ax_roc.set_ylabel("True Positive Rate (Sensitivity)")
+        ax_roc.set_xlim(0.0, 1.0)
+        ax_roc.set_ylim(0.0, 1.02)
+        ax_roc.set_title("(B) Out-of-Fold ROC Curve")
+        ax_roc.legend(loc="lower right", frameon=False)
+        ax_roc.grid(True)
+        saved.append(_save_pub_png(fig, p_dir / f"{norm_proto}_roc_pr_curves.png"))
+
+        # ── Diagnostic 3: Confusion Matrix & Probability Separation ({proto}_confusion_and_prob_dist.png) ──
+        ref_exps = [e for e in ("temporal", "combined_w5", "combined_w8") if e in oof_available]
+        if not ref_exps:
+            ref_exps = oof_available[:2]
+        n_cm = min(2, len(ref_exps))
+        chosen_cm = [ref_exps[0], ref_exps[-1]] if len(ref_exps) >= 2 else [ref_exps[0]]
+
+        fig, axes = plt.subplots(1, n_cm + 1, figsize=(5.2 * (n_cm + 1), 4.6), constrained_layout=True)
+        if n_cm + 1 == 2:
+            axes_list = [axes[0], axes[1]]
+        else:
+            axes_list = list(axes)
+        fig.suptitle(f"ML3 {norm_proto.upper()} — Normalized Confusion Matrices & Score Separation")
+
+        for idx_c, e in enumerate(chosen_cm):
+            ax_c = axes_list[idx_c]
+            op = resolved_summaries[e]["test"]["overall_trial_pooled"]
+            tn, fp, fn, tp = int(op["tn"]), int(op["fp"]), int(op["fn"]), int(op["tp"])
+            cm_raw = np.array([[tn, fp], [fn, tp]], dtype=np.float64)
+            row_sums = np.maximum(cm_raw.sum(axis=1, keepdims=True), 1.0)
+            cm_norm = cm_raw / row_sums * 100.0
+            im = ax_c.imshow(cm_norm, cmap="Blues", vmin=0.0, vmax=100.0)
+            for r_i in range(2):
+                for c_i in range(2):
+                    txt_col = "white" if cm_norm[r_i, c_i] > 55.0 else OKABE_ITO["black"]
+                    ax_c.text(
+                        c_i,
+                        r_i,
+                        f"{cm_norm[r_i, c_i]:.1f}%\n({int(cm_raw[r_i, c_i]):,})",
+                        ha="center",
+                        va="center",
+                        fontsize=9.0,
+                        fontweight="bold",
+                        color=txt_col,
+                    )
+            ax_c.set_xticks([0, 1])
+            ax_c.set_yticks([0, 1])
+            ax_c.set_xticklabels(["Pred Frequent", "Pred Target"])
+            ax_c.set_yticklabels(["True Frequent", "True Target"])
+            ax_c.set_title(f"({chr(65 + idx_c)}) {_exp_label(e)}")
+            ax_c.spines["top"].set_visible(True)
+            ax_c.spines["right"].set_visible(True)
+
+        ax_dist = axes_list[-1]
+        best_ref = chosen_cm[-1]
+        with np.load(p_dir / best_ref / "oof_predictions.npz", allow_pickle=False) as oof:
+            yt = oof["y_true"].astype(np.int64)
+            yp = oof["y_prob"].astype(np.float64)
+            thrs = oof["threshold"].astype(np.float64)
+        bins = np.linspace(0.0, 1.0, 42)
+        ax_dist.hist(
+            yp[yt == 0],
+            bins=bins,
+            density=True,
+            color=OKABE_ITO["blue"],
+            alpha=0.55,
+            label="True Frequent (0)",
+        )
+        ax_dist.hist(
+            yp[yt == 1],
+            bins=bins,
+            density=True,
+            color=OKABE_ITO["orange"],
+            alpha=0.58,
+            label="True Target (1)",
+        )
+        mean_thr = float(np.mean(thrs))
+        ax_dist.axvline(
+            mean_thr,
+            color=OKABE_ITO["red"],
+            ls="--",
+            lw=1.5,
+            label=f"Mean Val Threshold ({mean_thr:.3f})",
+        )
+        ax_dist.set_xlabel("Predicted Probability P(Target)")
+        ax_dist.set_ylabel("Density")
+        ax_dist.set_title(f"({chr(65 + len(chosen_cm))}) Score Separation — {_exp_label(best_ref)}")
+        ax_dist.legend(frameon=False)
+        ax_dist.grid(axis="y")
+        saved.append(_save_pub_png(fig, p_dir / f"{norm_proto}_confusion_and_prob_dist.png"))
+
+    # ── Diagnostic 4: XGBoost Gain Importance Breakdown ({proto}_feature_importance_breakdown.png) ──
+    imp_target = next(
+        (e for e in ("combined_w8", "combined_w5", "temporal", "wavelet_w8", "wavelet_w5") if e in exp_names),
+        None,
+    )
+    if imp_target is not None:
+        feat_names = _reconstruct_scenario_feature_names(p_dir, imp_target, features_dir=features_dir)
+        model_files = sorted((p_dir / imp_target).glob("fold_*/model.json"))
+        if feat_names and model_files:
+            n_feat = len(feat_names)
+            fold_gains = []
+            for mf in model_files:
+                m_obj = ML3XGBoostModel.load_model(mf, config=ML3XGBoostConfig(device="cpu"))
+                g = m_obj.gain_importance_vector(n_feat)
+                total_g = float(g.sum())
+                if total_g > 0.0:
+                    fold_gains.append(g / total_g * 100.0)
+                del m_obj
+            if fold_gains:
+                gain_mat = np.vstack(fold_gains)  # (n_folds, n_feat) in %
+                parsed_cols = [parse_ml3_feature_name(n) for n in feat_names]
+
+                fig, axes = plt.subplots(1, 3, figsize=(16.8, 5.4), constrained_layout=True)
+                fig.suptitle(
+                    f"ML3 {norm_proto.upper()} — Neurophysiological Feature Gain Breakdown ({_exp_label(imp_target)})"
+                )
+
+                # Panel A: Gain % by Time Window (stacked Temporal vs Wavelet)
+                ax_win = axes[0]
+                win_order = [w for w in W8_WINDOW_NAMES if any(p.window == w for p in parsed_cols)]
+                temp_win_pct = []
+                wav_win_pct = []
+                for w_name in win_order:
+                    t_idx = [i for i, p in enumerate(parsed_cols) if p.window == w_name and p.group == "temporal"]
+                    w_idx = [i for i, p in enumerate(parsed_cols) if p.window == w_name and p.group == "wavelet"]
+                    temp_win_pct.append(float(gain_mat[:, t_idx].sum(axis=1).mean()) if t_idx else 0.0)
+                    wav_win_pct.append(float(gain_mat[:, w_idx].sum(axis=1).mean()) if w_idx else 0.0)
+
+                wx = np.arange(len(win_order))
+                ax_win.bar(wx, temp_win_pct, width=0.58, color=OKABE_ITO["blue"], edgecolor=OKABE_ITO["black"], lw=0.6, label="Temporal Gain %")
+                ax_win.bar(
+                    wx,
+                    wav_win_pct,
+                    width=0.58,
+                    bottom=temp_win_pct,
+                    color=OKABE_ITO["green"],
+                    edgecolor=OKABE_ITO["black"],
+                    lw=0.6,
+                    label="Wavelet Gain %",
+                )
+                ax_win.set_xticks(wx)
+                ax_win.set_xticklabels([_WINDOW_DISPLAY.get(w, w) for w in win_order], rotation=28, ha="right")
+                ax_win.set_ylabel("Share of Total XGBoost Gain (%)")
+                ax_win.set_title("(A) Gain Distribution Across Epoch Windows (ms)")
+                ax_win.legend(frameon=False)
+                ax_win.grid(axis="y")
+
+                # Panel B: Top 15 EEG Channels by Gain %
+                ax_ch = axes[1]
+                channels = sorted({p.channel for p in parsed_cols})
+                ch_means = []
+                ch_stds = []
+                for ch in channels:
+                    c_idx = [i for i, p in enumerate(parsed_cols) if p.channel == ch]
+                    ch_fold_sums = gain_mat[:, c_idx].sum(axis=1)
+                    ch_means.append(float(ch_fold_sums.mean()))
+                    ch_stds.append(float(ch_fold_sums.std(ddof=1 if len(fold_gains) > 1 else 0)))
+                order_ch = np.argsort(ch_means)[::-1][:15][::-1]
+                cy = np.arange(len(order_ch))
+                ax_ch.barh(
+                    cy,
+                    [ch_means[i] for i in order_ch],
+                    xerr=[ch_stds[i] for i in order_ch],
+                    capsize=3,
+                    color=OKABE_ITO["purple"],
+                    edgecolor=OKABE_ITO["black"],
+                    lw=0.6,
+                    alpha=0.85,
+                )
+                ax_ch.set_yticks(cy)
+                ax_ch.set_yticklabels([channels[i] for i in order_ch])
+                ax_ch.set_xlabel("Share of Total Gain (%, Mean ± SD)")
+                ax_ch.set_title("(B) Top 15 Electrodes by Gain")
+                ax_ch.grid(axis="x")
+
+                # Panel C: Gain % by Feature Statistic / Band
+                ax_ft = axes[2]
+                feat_types = list(dict.fromkeys(f"{p.group}:{p.feature}" for p in parsed_cols))
+                ft_means = []
+                ft_cols = []
+                ft_labels = []
+                for ft in feat_types:
+                    grp, fn = ft.split(":", 1)
+                    f_idx = [i for i, p in enumerate(parsed_cols) if p.group == grp and p.feature == fn]
+                    ft_means.append(float(gain_mat[:, f_idx].sum(axis=1).mean()))
+                    ft_cols.append(OKABE_ITO["blue"] if grp == "temporal" else OKABE_ITO["green"])
+                    ft_labels.append(fn.replace("_", " "))
+                order_ft = np.argsort(ft_means)
+                fy = np.arange(len(order_ft))
+                ax_ft.barh(
+                    fy,
+                    [ft_means[i] for i in order_ft],
+                    color=[ft_cols[i] for i in order_ft],
+                    edgecolor=OKABE_ITO["black"],
+                    lw=0.6,
+                    alpha=0.86,
+                )
+                ax_ft.set_yticks(fy)
+                ax_ft.set_yticklabels([ft_labels[i] for i in order_ft])
+                ax_ft.set_xlabel("Share of Total Gain (%)")
+                ax_ft.set_title("(C) Gain by Temporal Stat & Wavelet Band")
+                ax_ft.grid(axis="x")
+
+                saved.append(_save_pub_png(fig, p_dir / f"{norm_proto}_feature_importance_breakdown.png"))
+
+    return saved
+
+
+def _reconstruct_scenario_feature_names(
+    protocol_dir: Path,
+    experiment: str,
+    *,
+    features_dir: Optional[Path | str] = None,
+) -> Optional[Tuple[str, ...]]:
+    """Reconstruct exact scenario feature_names from feature .npz files or channel metadata."""
+    channels: Optional[List[str]] = None
+
+    candidate_fdirs: List[Path] = []
+    if features_dir is not None:
+        candidate_fdirs.append(Path(features_dir))
+    candidate_fdirs.extend(
+        [
+            Path("/content/features"),
+            protocol_dir.parents[1] / "features",
+        ]
+    )
+    for cand in candidate_fdirs:
+        for grp in ("temporal", "wavelet"):
+            g_dir = cand / grp
+            if g_dir.is_dir():
+                npz_files = sorted(p for p in g_dir.glob("*.npz") if not p.name.endswith(".part.npz"))
+                if npz_files:
+                    with np.load(npz_files[0], allow_pickle=False) as payload:
+                        if "feature_names" in payload.files:
+                            raw_names = [str(x) for x in payload["feature_names"].tolist()]
+                            channels = list(dict.fromkeys(parse_ml3_feature_name(n).channel for n in raw_names))
+                            break
+        if channels:
+            break
+
+    if not channels:
+        channel_json = Path(__file__).resolve().parents[2] / "data" / "processed" / "channel_names.json"
+        if channel_json.is_file():
+            channels = [str(c) for c in json.loads(channel_json.read_text(encoding="utf-8"))]
+
+    if not channels:
+        summary_file = protocol_dir / experiment / "experiment_summary.json"
+        if not summary_file.is_file():
+            return None
+        summary = json.loads(summary_file.read_text(encoding="utf-8"))
+        n_feat = int(summary["n_features"])
+        spec = FEATURE_SCENARIO_SPECS.get(experiment)
+        if spec is None:
+            return None
+        per_ch = (56 if spec.uses_temporal else 0) + (
+            len(spec.wavelet_windows) * (6 if spec.uses_gamma else 5) if spec.wavelet_windows else 0
+        )
+        if per_ch <= 0 or n_feat % per_ch != 0:
+            return None
+        n_ch = n_feat // per_ch
+        channels = [f"Ch{i + 1:03d}" for i in range(n_ch)]
+
+    spec = FEATURE_SCENARIO_SPECS.get(experiment)
+    if spec is None or not channels:
+        return None
+
+    from src.features.ml3_features import TEMPORAL_STATISTICS
+    from src.features.ml3_feature_store import H4_BAND_FEATURES, GAMMA_ENERGY_FEATURE, H4_ENTROPY_FEATURE
+
+    names: list[str] = []
+    if spec.uses_temporal:
+        for w in W8_WINDOW_NAMES:
+            for ch in channels:
+                for st in TEMPORAL_STATISTICS:
+                    names.append(f"temporal|channel={ch}|window={w}|feature={st}")
+    if spec.wavelet_windows is not None:
+        w_feats = list(H4_BAND_FEATURES) + ([GAMMA_ENERGY_FEATURE] if spec.uses_gamma else []) + [H4_ENTROPY_FEATURE]
+        for w in spec.wavelet_windows:
+            for ch in channels:
+                for wf in w_feats:
+                    names.append(f"wavelet|channel={ch}|window={w}|feature={wf}")
+    return tuple(names)
+
 
 
 # ── High-Level Planning & Execution Orchestrator ─────────────────────────────
@@ -1597,6 +2494,7 @@ def run_ml3_experiments(
                     f"PR-AUC={tp['pr_auc']:.4f} "
                     f"ROC-AUC={tp['roc_auc']:.4f} "
                     f"BalAcc={tp['balanced_accuracy']:.4f} "
+                    f"F1={tp['f1_target']:.4f} "
                     f"time={f_metrics['train_duration_sec']:.1f}s"
                 )
 
@@ -1614,7 +2512,11 @@ def run_ml3_experiments(
         del scenario_matrix
         gc.collect()
 
-    comparison = write_protocol_comparison_and_plots(norm_protocol, protocol_dir)
+    comparison = write_protocol_comparison_and_plots(
+        norm_protocol,
+        protocol_dir,
+        features_dir=features_dir,
+    )
 
     return {
         "protocol": norm_protocol,
