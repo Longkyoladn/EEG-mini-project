@@ -1133,10 +1133,13 @@ def _exp_label(name: str) -> str:
 
 
 def _save_pub_png(fig: plt.Figure, out_path: Path) -> str:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+    target = ensure_drive_path_ready(out_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f"{target.stem}.tmp.png")
+    fig.savefig(tmp_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    return out_path.name
+    tmp_path.replace(target)
+    return target.name
 
 
 def _generate_cs5_plots(
@@ -1727,7 +1730,8 @@ def backfill_learning_curves_from_checkpoints(
     splits_dir: Path | str,
     protocol: ProtocolName | str,
     device: str = "cuda",
-    n_curve_points: int = 32,
+    n_curve_points: int = 20,
+    verbose: bool = True,
 ) -> int:
     """Reconstruct ``learning_curve.json`` & ``train_pooled`` from existing ``model.json`` checkpoints.
 
@@ -1768,12 +1772,20 @@ def backfill_learning_curves_from_checkpoints(
 
     updated_folds = 0
     cfg = ML3XGBoostConfig(device=device)
+    import xgboost as xgb
 
     for exp_name in missing_exps:
+        t_exp = time.perf_counter()
         scenario_matrix = dataset.build_scenario(exp_name)
         exp_dir = p_dir / exp_name
         fold_metrics_list = []
         fold_preds_list = []
+
+        # Build ONE DMatrix per experiment (shared across all folds & tree checkpoints!)
+        # Reusing a single immutable DMatrix enables XGBoost's internal prediction cache
+        # and avoids rebuilding ~700MB DMatrix buffers per fold/round.
+        full_dm = xgb.DMatrix(scenario_matrix.values)
+        exp_updated = 0
 
         for fold_dir in sorted(exp_dir.glob("fold_*")):
             m_path = fold_dir / "metrics.json"
@@ -1783,62 +1795,84 @@ def backfill_learning_curves_from_checkpoints(
                 continue
 
             f_metrics = json.loads(m_path.read_text(encoding="utf-8"))
-            fold_idx = int(f_metrics["fold"])
-            split = fold_by_idx[fold_idx]
-            train_idx, val_idx, _ = resolve_subject_fold_indices(
-                split, scenario_matrix.subject_ids, scenario_matrix.trial_uids
-            )
-            X_tr = scenario_matrix.values[train_idx]
-            y_tr = scenario_matrix.targets[train_idx]
-            X_va = scenario_matrix.values[val_idx]
-            y_va = scenario_matrix.targets[val_idx]
-
-            best_iter = int(f_metrics["best_iteration"])
-            model = ML3XGBoostModel.load_model(mod_path, config=cfg, best_iteration=best_iter)
-            assert model.estimator_ is not None
-            model.estimator_.set_params(device=device)
-
-            if "train_pooled" not in f_metrics:
-                tr_prob = model.predict_proba_positive(X_tr)
-                f_metrics["train_pooled"] = _format_metric_with_confusion(
-                    compute_binary_metrics(y_tr, tr_prob, threshold=float(f_metrics["threshold"]))
-                )
-                _atomic_write_json(m_path, f_metrics)
-
             lc_path = fold_dir / "learning_curve.json"
-            if not lc_path.is_file():
-                total_rounds = int(model.estimator_.get_booster().num_boosted_rounds())
-                grid = np.unique(
-                    np.concatenate(
-                        [
-                            np.linspace(1, max(1, total_rounds), num=min(n_curve_points, max(1, total_rounds)), dtype=int),
-                            np.array([min(total_rounds, best_iter + 1), total_rounds], dtype=int),
-                        ]
+            need_train = "train_pooled" not in f_metrics
+            need_lc = not lc_path.is_file()
+
+            if need_train or need_lc:
+                fold_idx = int(f_metrics["fold"])
+                split = fold_by_idx[fold_idx]
+                train_idx, val_idx, _ = resolve_subject_fold_indices(
+                    split, scenario_matrix.subject_ids, scenario_matrix.trial_uids
+                )
+                y_tr = scenario_matrix.targets[train_idx]
+                y_va = scenario_matrix.targets[val_idx]
+
+                best_iter = int(f_metrics["best_iteration"])
+                model = ML3XGBoostModel.load_model(mod_path, config=cfg, best_iteration=best_iter)
+                assert model.estimator_ is not None
+                booster = model.estimator_.get_booster()
+                booster.set_param({"device": device})
+
+                if need_train:
+                    p_all_best = np.asarray(
+                        booster.predict(full_dm, iteration_range=(0, best_iter + 1)),
+                        dtype=np.float64,
                     )
-                )
-                tr_curve: list[float] = []
-                va_curve: list[float] = []
-                for ntree in grid:
-                    p_tr = model.estimator_.predict_proba(X_tr, iteration_range=(0, int(ntree)))[:, 1]
-                    p_va = model.estimator_.predict_proba(X_va, iteration_range=(0, int(ntree)))[:, 1]
-                    tr_curve.append(float(average_precision_score(y_tr, p_tr)))
-                    va_curve.append(float(average_precision_score(y_va, p_va)))
-                _atomic_write_json(
-                    lc_path,
-                    {
-                        "fold": fold_idx,
-                        "best_iteration": best_iter,
-                        "rounds": [int(v) for v in grid.tolist()],
-                        "train_aucpr": tr_curve,
-                        "val_aucpr": va_curve,
-                    },
-                )
-            updated_folds += 1
+                    f_metrics["train_pooled"] = _format_metric_with_confusion(
+                        compute_binary_metrics(
+                            y_tr,
+                            p_all_best[train_idx],
+                            threshold=float(f_metrics["threshold"]),
+                        )
+                    )
+                    _atomic_write_json(m_path, f_metrics)
+
+                if need_lc:
+                    total_rounds = int(booster.num_boosted_rounds())
+                    grid = np.unique(
+                        np.concatenate(
+                            [
+                                np.linspace(
+                                    1,
+                                    max(1, total_rounds),
+                                    num=min(n_curve_points, max(1, total_rounds)),
+                                    dtype=int,
+                                ),
+                                np.array([min(total_rounds, best_iter + 1), total_rounds], dtype=int),
+                            ]
+                        )
+                    )
+                    tr_curve: list[float] = []
+                    va_curve: list[float] = []
+                    for ntree in grid:
+                        p_all = booster.predict(full_dm, iteration_range=(0, int(ntree)))
+                        tr_curve.append(float(average_precision_score(y_tr, p_all[train_idx])))
+                        va_curve.append(float(average_precision_score(y_va, p_all[val_idx])))
+                    _atomic_write_json(
+                        lc_path,
+                        {
+                            "fold": fold_idx,
+                            "best_iteration": best_iter,
+                            "rounds": [int(v) for v in grid.tolist()],
+                            "train_aucpr": tr_curve,
+                            "val_aucpr": va_curve,
+                        },
+                    )
+
+                updated_folds += 1
+                exp_updated += 1
+                del booster, model
+
             fold_metrics_list.append(f_metrics)
             with np.load(p_path, allow_pickle=False) as payload:
                 fold_preds_list.append({k: np.asarray(payload[k]) for k in payload.files})
 
-            del model
+        if verbose:
+            print(
+                f"[Backfill][{norm_proto.upper()}][{exp_name}] "
+                f"updated {exp_updated} fold(s) in {time.perf_counter() - t_exp:.1f}s"
+            )
 
         if fold_metrics_list:
             aggregate_experiment_results(
@@ -1849,7 +1883,7 @@ def backfill_learning_curves_from_checkpoints(
                 fold_metrics_list=fold_metrics_list,
                 fold_preds_list=fold_preds_list,
             )
-        del scenario_matrix
+        del full_dm, scenario_matrix
         gc.collect()
 
     return updated_folds
